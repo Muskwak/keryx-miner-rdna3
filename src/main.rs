@@ -509,12 +509,24 @@ async fn main() -> Result<(), Error> {
             opt.devfund_address
         );
     }
+    // Reconnect with exponential backoff so a pool that drops the socket right after connect
+    // (rate-limit, restart, transient blip) doesn't turn into a tight reconnect storm that
+    // hammers the pool and gets the IP throttled/banned. A connection that stays up for a while
+    // resets the delay back to the minimum.
+    let mut backoff = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
     loop {
+        let started = std::time::Instant::now();
         match client_main(&opt, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone()).await {
             Ok(_) => info!("Client closed gracefully"),
             Err(e) => error!("Client closed with error {:?}", e),
         }
-        info!("Client closed, reconnecting");
-        sleep(Duration::from_millis(100));
+        // Healthy session (stayed connected a while) → reset; rapid drops → grow the delay.
+        if started.elapsed() >= Duration::from_secs(60) {
+            backoff = Duration::from_secs(1);
+        }
+        info!("Client closed, reconnecting in {}s", backoff.as_secs());
+        sleep(backoff);
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
