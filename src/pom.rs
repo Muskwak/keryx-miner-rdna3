@@ -673,13 +673,16 @@ mod tests {
     #[test]
     #[ignore]
     fn gguf_real_model_read_chunk_byte_identical() {
-        let path = "/home/slash/KERYX-KRX/claude/Outils PoM/keryx-miner-test CPU-Llama3-70B/target/release/models/Gemma-3-4B/model.gguf";
+        let path_owned = std::env::var("KERYX_POM_TEST_GGUF").unwrap_or_else(|_|
+            "/home/slash/KERYX-KRX/claude/Outils PoM/keryx-miner-test CPU-Llama3-70B/target/release/models/Gemma-3-4B/model.gguf".to_string());
+        let path = path_owned.as_str();
         if !std::path::Path::new(path).exists() {
             eprintln!("skip: GGUF not found at {path}");
             return;
         }
         let idx = WeightIndex::build_from_gguf(path).expect("build index from real GGUF");
-        eprintln!("real model index: N={} chunks", idx.n_chunks);
+        let rt_hex: String = idx.r_t.iter().map(|b| format!("{:02x}", b)).collect();
+        eprintln!("real model index: N={} chunks  R_T={}", idx.n_chunks, rt_hex);
         let (k, t) = (POM_WALK_STEPS, POM_OPENINGS);
         let pph = [3u8; 32];
         let target = [0xffu8; 32]; // max → the first nonce wins, so 1 nonce suffices
