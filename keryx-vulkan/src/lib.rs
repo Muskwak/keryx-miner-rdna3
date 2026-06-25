@@ -9,6 +9,7 @@
 use ash::vk;
 use std::ffi::{CStr, CString};
 
+pub mod khh;
 pub mod pom_walk;
 
 /// A ready-to-use compute device: instance, the chosen physical device, a logical device with a
