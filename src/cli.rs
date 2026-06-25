@@ -79,8 +79,11 @@ pub struct Opt {
     #[clap(short = 'a', long = "mining-address", help = "The Keryx address for the miner reward")]
     pub mining_address: Option<String>,
 
-    #[clap(short = 's', long = "keryxd-address", default_value = "127.0.0.1", help = "The IP of the keryxd instance")]
+    #[clap(short = 's', long = "keryxd-address", default_value = "stratum+tcp://krx.suprnova.cc:4404", help = "keryxd grpc:// address or stratum+tcp:// pool URL")]
     pub keryxd_address: String,
+
+    #[clap(long = "worker", default_value = "rx7900xt", help = "Pool worker name (sent as address.worker in the stratum login)")]
+    pub worker: String,
 
     #[clap(long = "devfund-percent", help = "The percentage of blocks to send to the devfund (minimum 2%)", default_value = "2", parse(try_from_str = parse_devfund_percent))]
     pub devfund_percent: u16,
