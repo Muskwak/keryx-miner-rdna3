@@ -12,6 +12,12 @@ use std::ffi::{CStr, CString};
 pub mod khh;
 pub mod pom_walk;
 
+/// Quick probe: the name of the Vulkan compute device, or None if no loader/device is usable.
+/// Used by the miner's startup inference check (the RDNA3 equivalent of the old cuBLAS probe).
+pub fn probe_device() -> Option<String> {
+    Vk::new().ok().map(|vk| vk.device_name().to_string())
+}
+
 /// A ready-to-use compute device: instance, the chosen physical device, a logical device with a
 /// compute queue, and a command pool. One per process (the miner uses a single GPU).
 pub struct Vk {

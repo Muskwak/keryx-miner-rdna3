@@ -15,8 +15,3 @@ rand = "0.8"
 # Trusted Keccak-f[1600] oracle for the kHeavyHash test — the same crate the miner's host PoW
 # path uses on Windows, so the GPU shader is validated against the real reference permutation.
 keccak = "0.1"
-
-# Standalone during bring-up: detaches this crate from the miner workspace (whose root package
-# still pulls candle/CUDA) so it builds and tests on an AMD-only host. Folded into the workspace
-# once the main crate is de-CUDA'd.
-[workspace]

@@ -3,12 +3,12 @@ use std::any::Any;
 use std::error::Error as StdError;
 
 pub mod inference;
+pub mod llama_server;
 pub mod models;
 pub mod pom;
 pub mod pom_gpu;
-pub mod quantized_llama_split;
-pub mod quantized_qwen3_split;
 pub mod slm;
+pub mod vulkan_worker;
 pub mod xoshiro256starstar;
 use libloading::{Library, Symbol};
 
@@ -60,6 +60,12 @@ impl PluginManager {
         self.plugins.push(plugin);
 
         Ok(app)
+    }
+
+    /// Register an in-process plugin (RDNA3 fork: the Vulkan worker, instead of a cdylib loaded
+    /// from disk). Counts toward `has_specs`/`build` exactly like a dynamically-loaded plugin.
+    pub fn register(&mut self, plugin: Box<dyn Plugin>) {
+        self.plugins.push(plugin);
     }
 
     pub fn build(&self) -> Result<Vec<Box<dyn WorkerSpec + 'static>>, Error> {

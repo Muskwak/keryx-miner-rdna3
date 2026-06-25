@@ -52,12 +52,14 @@ semver = "1.0"
 # Proof-of-Model: possession proof construction (borsh wire-format must match the node).
 borsh = { version = "1", features = ["derive"] }
 blake3 = "1"
-# Phase-3 OPoI: SLM inference via candle
-candle-core = { version = "0.9", features = ["cuda"] }
-candle-transformers = { version = "0.9", features = ["cuda"] }
-candle-nn = { version = "0.9", features = ["cuda"] }
-tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
-ureq = { version = "2", features = ["tls"] }
+# RDNA3 fork — OPoI inference is served by a prebuilt llama.cpp **Vulkan** `llama-server`
+# over localhost HTTP (see slm.rs); no in-process LLM engine, no CUDA, no CPU inference.
+# candle-core is kept ONLY as a CPU GGUF / quantized-tensor reader for the PoM weight blob;
+# candle-transformers / candle-nn / tokenizers went out with the candle engine.
+candle-core = { version = "0.9", default-features = false }
+# Vulkan compute backend: PoM walk + kHeavyHash PoW kernels for RDNA3 (verified on a 7900 XT).
+keryx-vulkan = { path = "keryx-vulkan" }
+ureq = { version = "2", features = ["tls", "json"] }
 base64 = "0.22"
 anyhow = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
@@ -89,12 +91,7 @@ time = { version = "0.3", features = ["formatting"] }
 sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 
 [workspace]
-members = ["inference", "plugins/*"]
-default-members = [".", "plugins/cuda", "plugins/opencl"]
-
-# Vendored candle-kernels: the upstream MoE bf16 WMMA kernels only compile for
-# sm_80+, which would exclude Turing/Pascal (and thus all pre-Ampere miners) from
-# inference. The vendored copy guards those kernel bodies with `#if __CUDA_ARCH__
-# >= 800` so the crate builds at sm_75 (stub on older archs, real MoE on sm_80+).
-[patch.crates-io]
-candle-kernels = { path = "vendor/candle-kernels" }
+# RDNA3 fork: the CUDA/OpenCL PoW plugins are gone (replaced by the in-process Vulkan worker);
+# keryx-vulkan joins the workspace. No candle-kernels patch — there is no CUDA kernel build.
+members = ["inference", "keryx-vulkan"]
+default-members = ["."]
