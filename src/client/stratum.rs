@@ -20,7 +20,7 @@ use crate::pow::BlockSeed::PartialBlock;
 use crate::{miner::MinerManager, Error, Uint256};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use num::Float;
 use rand::{thread_rng, RngCore};
 use statum_codec::NewLineJsonCodec;
@@ -199,10 +199,17 @@ impl Client for StratumHandler {
             .await?;
 
         // Declare loaded SLM models so the bridge can challenge with the right model.
-        let model_ids: Vec<String> = keryx_miner::slm::loaded_model_ids()
-            .into_iter()
-            .map(|id| hex::encode(id))
-            .collect();
+        // PoW-only mode serves no inference, so it must announce ZERO models — otherwise the
+        // bridge challenges a model we won't answer, our empty response makes the pool drop the
+        // socket, and the supervisor loops on short sessions.
+        let model_ids: Vec<String> = if keryx_miner::pow_only() {
+            Vec::new()
+        } else {
+            keryx_miner::slm::loaded_model_ids()
+                .into_iter()
+                .map(|id| hex::encode(id))
+                .collect()
+        };
         if !model_ids.is_empty() {
             info!("OPoI: declaring {} model(s) to pool bridge", model_ids.len());
             self.send_channel
@@ -651,6 +658,13 @@ impl StratumHandler {
     /// it has the requested model loaded and can produce inference output. The result is
     /// sent back as `mining.challenge_response` so the bridge can forward it to the node.
     async fn handle_challenge(&mut self, model_id_hex: String, nonce_hex: String, miner: &mut MinerManager) {
+        // PoW-only mode runs no inference. We declare zero models, so a well-behaved bridge never
+        // challenges us — but a stale declaration from a prior full-mode session might. Ignore it
+        // silently rather than replying empty (an empty response makes the pool drop the socket).
+        if keryx_miner::pow_only() {
+            debug!("OPoI challenge for model {:.8} ignored — PoW-only mode (no inference)", model_id_hex);
+            return;
+        }
         // Only one challenge in flight at a time — bridge will re-challenge if needed.
         if self.challenge_in_flight.swap(true, Ordering::SeqCst) {
             warn!("OPoI challenge: already in flight, dropping new challenge for model {:.8}", model_id_hex);
