@@ -18,6 +18,14 @@ pub fn probe_device() -> Option<String> {
     Vk::new().ok().map(|vk| vk.device_name().to_string())
 }
 
+/// Quick probe: total VRAM (MiB) of the Vulkan compute device the miner mines/serves on, or
+/// None if no usable device. RDNA3 replacement for the upstream `nvidia-smi` VRAM query — the
+/// figure comes from the same device pick the compute backend uses, so it matches what the
+/// miner can actually allocate. Used by the model capability gate.
+pub fn probe_vram_mb() -> Option<u64> {
+    Vk::new().ok().map(|vk| vk.device_local_vram_mb())
+}
+
 /// A ready-to-use compute device: instance, the chosen physical device, a logical device with a
 /// compute queue, and a command pool. One per process (the miner uses a single GPU).
 pub struct Vk {
@@ -122,6 +130,21 @@ impl Vk {
     /// Human-readable name of the selected GPU (e.g. "AMD Radeon RX 7900 XT").
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// Total VRAM (MiB) = the largest `DEVICE_LOCAL` memory heap on the selected GPU. Taking the
+    /// max (not the sum) avoids double-counting the small host-visible BAR heap AMD reports as a
+    /// separate device-local window into the same VRAM, so this matches the figure the driver and
+    /// llama-server print (e.g. 20464 MiB on a 7900 XT).
+    pub fn device_local_vram_mb(&self) -> u64 {
+        let heaps = &self.mem_props.memory_heaps[..self.mem_props.memory_heap_count as usize];
+        let bytes = heaps
+            .iter()
+            .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|h| h.size)
+            .max()
+            .unwrap_or(0);
+        bytes / (1024 * 1024)
     }
 
     fn find_memory_type(&self, type_bits: u32, flags: vk::MemoryPropertyFlags) -> Result<u32, String> {

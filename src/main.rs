@@ -70,49 +70,19 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
     }
 }
 
-/// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
+/// Warn if GPU 0's VRAM is too small for the selected model tier (queried via Vulkan — the same
+/// device the miner mines/serves on). Non-fatal: a host/CPU path can still serve it, so warn
+/// rather than error. The capability gate (`filter_specs_by_vram`) does the announce-time drop;
+/// this is just an upfront, tier-labelled heads-up.
 ///
-/// VRAM requirements (GGUF Q4_K_M weights only, not counting CUDA workspace):
+/// VRAM requirements (GGUF Q4_K_M weights only, not counting GPU workspace):
 ///   Gemma-3-4B      →  ~2.7 GB
 ///   Dolphin-8B      →  ~4.9 GB
 ///   Qwen3-32B       → ~19.5 GB  (requires ≥24 GB card)
 ///   Llama-3.3-70B   → ~42.5 GB  (requires ≥48 GB card)
-///
-/// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
-fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
-    let output = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=power.limit,power.max_limit,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        .output();
+fn check_gpu_vram_for_tier(needs_high: bool, needs_very_high: bool) {
+    let Some(vram_mb) = query_vram_mb() else { return };
 
-    // nvidia-smi prints one line per GPU; the power + VRAM check applies to GPU 0
-    // (the device the miner mines/serves on).
-    let (current_w, vram_mb) = match output {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            let mut cur = 0u32;
-            let mut vram = 0u64;
-            for (i, line) in s.trim().lines().take(1).enumerate() {
-                let mut parts = line.split(',');
-                let line_cur: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
-                let _max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
-                let line_vram: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
-                if i == 0 {
-                    cur = line_cur as u32;
-                }
-                vram += line_vram;
-            }
-            (cur, vram)
-        }
-        _ => return,
-    };
-
-    // VRAM sufficiency for the selected tier (Q4_K_M weights + KV cache + CUDA workspace).
-    // Insufficient VRAM means GPU inference for this tier will OOM. This is non-fatal — a
-    // host/CPU path can still serve it — so warn rather than error, and do NOT then claim the
-    // model is "ready" on the same GPU (the contradictory ERROR-then-ready pair).
     let (model_label, min_vram_mb): (&str, u64) = if needs_very_high {
         ("Llama-3.3-70B (--very-high)", 46_000)
     } else if needs_high {
@@ -131,35 +101,27 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
             vram_mb / 1024,
         );
     } else {
-        log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
+        log::info!("GPU: {} MB VRAM — ready for {}", vram_mb, model_label);
     }
 }
 
-/// GPU 0 total VRAM (MB) via nvidia-smi, or None when nvidia-smi is unavailable or
-/// unparseable (e.g. AMD-only machines). GPU 0 is the device the miner mines/serves on.
+/// GPU 0 total VRAM (MB) via the Vulkan device the miner mines/serves on, or None when no
+/// usable Vulkan device is present. Memoized: the probe spins up a transient Vulkan device, so
+/// the result is cached across the two lineup capability-gate calls.
 fn query_vram_mb() -> Option<u64> {
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .and_then(|l| l.trim().parse::<u64>().ok())
+    static VRAM_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *VRAM_MB.get_or_init(keryx_vulkan::probe_vram_mb)
 }
 
 /// OPoI capability gate (layer A): drop the models this machine cannot actually
 /// serve on GPU 0, so the `ai:cap` announcement never promises a model the miner
-/// would fail to load. Skipped when nvidia-smi is unavailable (CPU-fallback setups
-/// keep working).
+/// would fail to load. Skipped when no Vulkan device can be queried (CPU-fallback
+/// setups keep working).
 fn filter_specs_by_vram(
     specs: &'static [&'static keryx_miner::models::ModelSpec],
 ) -> &'static [&'static keryx_miner::models::ModelSpec] {
     let Some(gpu0_mb) = query_vram_mb() else {
-        log::warn!("Cannot query GPU VRAM (nvidia-smi) — skipping the model capability gate.");
+        log::warn!("Cannot query GPU VRAM (no Vulkan device) — skipping the model capability gate.");
         return specs;
     };
     let kept: Vec<&'static keryx_miner::models::ModelSpec> = specs
@@ -381,9 +343,8 @@ async fn main() -> Result<(), Error> {
     //   --high       → Qwen3-32B
     //   --very-high  → Llama-3.3-70B
 
-    // Warn if GPU power limit is below safe threshold for the selected model tier.
-    // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
-    check_gpu_power_limit(opt.high || opt.very_high, opt.very_high);
+    // Warn if GPU 0's VRAM is too small for the selected model tier (Vulkan-queried).
+    check_gpu_vram_for_tier(opt.high || opt.very_high, opt.very_high);
 
     let tier = if opt.very_high {
         info!("--very-high mode: top tier — mines Llama-3.3-70B under PoM.");
