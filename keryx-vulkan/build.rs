@@ -40,7 +40,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
 
         let status = Command::new(&glslc)
-            .args(["-O", "--target-env=vulkan1.2"])
+            .args(["-O", "--target-env=vulkan1.3"])
             .arg(&path)
             .arg("-o")
             .arg(&spv)

@@ -7,8 +7,10 @@ use std::io::Cursor;
 
 const KHH_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/khh.spv"));
 
-/// 64x64 matrix of 4-bit entries.
+/// 64x64 matrix of 4-bit entries (the public, row-major unpacked form callers pass in).
 pub const MATRIX_LEN: usize = 64 * 64;
+/// Packed GPU form: 4 row-major entries per u32 (byte b = entry 4*w+b), for `dotPacked4x8`.
+const MATRIX_PACKED_LEN: usize = MATRIX_LEN / 4;
 const NO_WINNER: u32 = 0xFFFF_FFFF;
 
 /// Push-constant block — must match the `Push` block in `khh.comp`: eleven u64 (header[9],
@@ -41,7 +43,7 @@ impl KhhGpu {
         let vk = Vk::new()?;
         let spirv = ash::util::read_spv(&mut Cursor::new(KHH_SPV)).map_err(|e| e.to_string())?;
         let kernel = vk.make_kernel(&spirv, 2, std::mem::size_of::<KhhPush>() as u32)?;
-        let matrix = vk.create_buffer((MATRIX_LEN * 4) as u64)?;
+        let matrix = vk.create_buffer((MATRIX_PACKED_LEN * 4) as u64)?;
         let winner = vk.create_buffer(4)?;
         Ok(Self { vk, kernel, matrix, winner, header: [0; 9], target: [0; 4] })
     }
@@ -53,7 +55,13 @@ impl KhhGpu {
     /// Load a block's constants: the 64x64 4-bit matrix (row-major), the 72-byte pow header as 9
     /// LE u64 words, and the 256-bit target as 4 LE u64 words (`word[3]` most significant).
     pub fn upload_block(&mut self, matrix: &[u32; MATRIX_LEN], header: [u64; 9], target: [u64; 4]) {
-        self.vk.write_buffer(&self.matrix, u32s_as_bytes(matrix));
+        // Pack 4 row-major 4-bit entries per u32 (entry e at byte e%4) so the shader can use the
+        // hardware 4x8-bit packed dot product. Entry j and nibble j line up at the same byte.
+        let mut packed = [0u32; MATRIX_PACKED_LEN];
+        for (e, &v) in matrix.iter().enumerate() {
+            packed[e >> 2] |= (v & 0xFF) << (8 * (e & 3));
+        }
+        self.vk.write_buffer(&self.matrix, u32s_as_bytes(&packed));
         self.header = header;
         self.target = target;
     }

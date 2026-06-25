@@ -43,7 +43,7 @@ impl Vk {
             let entry = ash::Entry::load().map_err(|e| format!("Vulkan loader (vulkan-1) not found: {e}"))?;
             let app_info = vk::ApplicationInfo::default()
                 .application_name(c"keryx-miner-rdna3")
-                .api_version(vk::make_api_version(0, 1, 2, 0));
+                .api_version(vk::make_api_version(0, 1, 3, 0));
             let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
             let instance = entry
                 .create_instance(&create_info, None)
@@ -83,10 +83,14 @@ impl Vk {
             let qcis = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&priorities)];
+            // shader_int64 for the 64-bit folds; shader_integer_dot_product for the kHeavyHash
+            // matmul (the hardware 4x8-bit packed dot — RDNA3's v_dot4_u32_u8).
             let features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
+            let mut features13 = vk::PhysicalDeviceVulkan13Features::default().shader_integer_dot_product(true);
             let dci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&qcis)
-                .enabled_features(&features);
+                .enabled_features(&features)
+                .push_next(&mut features13);
             let device = instance
                 .create_device(pdevice, &dci, None)
                 .map_err(|e| format!("create_device failed: {e}"))?;

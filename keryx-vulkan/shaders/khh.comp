@@ -9,13 +9,19 @@
 // The matrix is generated host-side (Matrix::generate, salt-versioned) and uploaded; the kernel
 // only consumes it — so no PRNG/rank-check is needed on the GPU.
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_integer_dot_product : require
 
 layout(local_size_x = 64) in;
 
-// 64x64 matrix of 4-bit entries (0..15), row-major: mat[row*64 + col]. Uploaded as u32 per entry.
+// 64x64 matrix of 4-bit entries, packed 4 row-major entries per u32 (entry e at byte e%4) — the
+// layout the 4x8-bit packed dot product consumes. 64x64 entries => 1024 u32.
 layout(std430, binding = 0) readonly buffer Matrix { uint m[]; } MAT;
 // Lowest winning batch offset (nonce - start); host inits to 0xFFFFFFFF.
 layout(std430, binding = 1) buffer Winner { uint offset; } OUT;
+
+// The matrix is reused by every nonce, so cache it once per workgroup in shared memory (LDS) and
+// read it from there instead of from global memory in the inner loop.
+shared uint matLds[1024];
 
 layout(push_constant) uniform Push {
     uint64_t header[9];   // pre_pow_hash(4) || timestamp(1) || 0^32 (4)  — the 72-byte pow header
@@ -91,6 +97,13 @@ void keccakf(inout uint64_t a[25]) {
 }
 
 void main() {
+    // Cooperatively cache the packed matrix in LDS. ALL threads run this and the barrier BEFORE
+    // any early-out, so a partially-filled final workgroup cannot deadlock on the barrier.
+    for (uint t = gl_LocalInvocationID.x; t < 1024u; t += gl_WorkGroupSize.x) {
+        matLds[t] = MAT.m[t];
+    }
+    barrier();
+
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= pc.batch) {
         return;
@@ -107,20 +120,28 @@ void main() {
     keccakf(a);
     uint64_t pw[4] = uint64_t[4](a[0], a[1], a[2], a[3]); // PoW hash, 32 LE bytes
 
-    // 2. 64 nibbles of the PoW hash (high nibble first), then the 64x64 4-bit matmul.
-    uint nib[64];
-    for (uint i = 0u; i < 32u; ++i) {
-        uint b = uint((pw[i >> 3u] >> (8u * (i & 7u))) & 0xFFUL);
-        nib[2u * i] = b >> 4u;
-        nib[2u * i + 1u] = b & 0x0Fu;
+    // 2. Pack the 64 PoW-hash nibbles (high nibble first) into 16 u32 (4 per word) so each lines
+    //    up byte-for-byte with a packed matrix word, then run the 64x64 4-bit matmul as 4x8-bit
+    //    packed dot products. Entry j multiplies nibble j, exactly as the scalar form did.
+    uint nibv[16];
+    for (uint k = 0u; k < 16u; ++k) {
+        uint v = 0u;
+        for (uint q = 0u; q < 4u; ++q) {
+            uint nidx = 4u * k + q;                                 // nibble index 0..63
+            uint bi = nidx >> 1u;                                   // PoW-hash byte holding it
+            uint b = uint((pw[bi >> 3u] >> (8u * (bi & 7u))) & 0xFFUL);
+            uint nibble = ((nidx & 1u) == 0u) ? (b >> 4u) : (b & 0x0Fu); // even = high nibble
+            v |= nibble << (8u * q);
+        }
+        nibv[k] = v;
     }
     uint pbytes[32];
     for (uint i = 0u; i < 32u; ++i) {
         uint sum1 = 0u;
         uint sum2 = 0u;
-        for (uint j = 0u; j < 64u; ++j) {
-            sum1 += MAT.m[(2u * i) * 64u + j] * nib[j];
-            sum2 += MAT.m[(2u * i + 1u) * 64u + j] * nib[j];
+        for (uint k = 0u; k < 16u; ++k) {
+            sum1 += dotPacked4x8EXT(matLds[(2u * i) * 16u + k], nibv[k]);
+            sum2 += dotPacked4x8EXT(matLds[(2u * i + 1u) * 16u + k], nibv[k]);
         }
         uint matbyte = ((sum1 >> 10u) << 4u) | (sum2 >> 10u);
         uint hbyte = uint((pw[i >> 3u] >> (8u * (i & 7u))) & 0xFFUL);
