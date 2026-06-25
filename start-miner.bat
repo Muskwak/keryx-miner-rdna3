@@ -11,7 +11,8 @@ REM --- Your Keryx payout address ---
 set "MINING_ADDRESS=keryx:qz4zajm2kecfy5c6qctepdnt4666yz0qhff5alnhyy6jjzfm94svxylck57rh"
 
 REM --- Pool and worker name (these are also the built-in defaults) ---
-set "POOL=stratum+tcp://krx.suprnova.cc:4404"
+REM set "POOL=stratum+tcp://krx.suprnova.cc:4404"
+set "POOL=stratum+tcp://krx.baikalmine.com:9020"
 set "WORKER=rx7900xt"
 
 REM --- GPU PoW batch size (nonces per dispatch). 4194304 (4M) is tuned for the
