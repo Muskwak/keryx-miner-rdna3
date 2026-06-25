@@ -427,14 +427,18 @@ impl StratumHandler {
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
-                            if keryx_miner::slm::loaded_model_ids().is_empty() {
+                            if !keryx_miner::pow_only() && keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
                                     warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
                                 }
                                 return miner.process_block(None).await;
                             }
-                            let inference_started =
-                                self.handle_ai_task(id.clone(), task_json, miner).await;
+                            // PoW-only test mode: ignore the AiRequest task entirely and just mine.
+                            let inference_started = if keryx_miner::pow_only() {
+                                false
+                            } else {
+                                self.handle_ai_task(id.clone(), task_json, miner).await
+                            };
                             if inference_started {
                                 // PoW already paused inside handle_ai_task — do NOT feed a new
                                 // block template or the GPU immediately resumes hashing.
@@ -465,7 +469,7 @@ impl StratumHandler {
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
-                            if keryx_miner::slm::loaded_model_ids().is_empty() {
+                            if !keryx_miner::pow_only() && keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
                                     warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
                                 }
@@ -492,7 +496,7 @@ impl StratumHandler {
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
-                            if keryx_miner::slm::loaded_model_ids().is_empty() {
+                            if !keryx_miner::pow_only() && keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
                                     warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
                                 }

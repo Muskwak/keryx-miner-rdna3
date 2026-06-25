@@ -228,8 +228,11 @@ async fn client_main(
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
 ) -> Result<(), Error> {
-    let ipfs_url = opt.ipfs_url.clone();
-    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url)).await.ok();
+    // IPFS is only needed to serve/fetch OPoI model files; skip it in PoW-only test mode.
+    if !keryx_miner::pow_only() {
+        let ipfs_url = opt.ipfs_url.clone();
+        tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url)).await.ok();
+    }
 
     let mut client = get_client(
         opt.keryxd_address.clone(),
@@ -427,6 +430,9 @@ async fn main() -> Result<(), Error> {
     // Block on BOTH lineups before mining: never start hashing while a model this miner
     // will serve — the legacy set now AND the uncensored set after the hardfork swap — is
     // still downloading. The readiness-gated swap then activates v2 instantly at H.
+    if keryx_miner::pow_only() {
+        info!("PoW-only mode (KERYX_POW_ONLY): skipping OPoI model prefetch + inference probe.");
+    } else {
     match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await {
         Ok(Ok(())) => log::debug!("Legacy model files ready."),
         Ok(Err(e)) => {
@@ -483,6 +489,7 @@ async fn main() -> Result<(), Error> {
             return Err(e.into());
         }
     }
+    } // end: not PoW-only
     info!("Found plugins: {:?}", plugins);
     info!("Plugins found {} workers", worker_count);
     if worker_count == 0 && opt.num_threads.unwrap_or(0) == 0 {

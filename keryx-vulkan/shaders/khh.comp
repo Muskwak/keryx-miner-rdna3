@@ -18,9 +18,11 @@ layout(std430, binding = 0) readonly buffer Matrix { uint m[]; } MAT;
 layout(std430, binding = 1) buffer Winner { uint offset; } OUT;
 
 layout(push_constant) uniform Push {
-    uint64_t header[9]; // pre_pow_hash(4) || timestamp(1) || 0^32 (4)  — the 72-byte pow header
-    uint64_t target[4]; // 256-bit target, little-endian words (word[3] most significant)
+    uint64_t header[9];   // pre_pow_hash(4) || timestamp(1) || 0^32 (4)  — the 72-byte pow header
+    uint64_t target[4];   // 256-bit target, little-endian words (word[3] most significant)
     uint64_t start_nonce;
+    uint64_t nonce_mask;  // bits the miner controls (full = solo; a low-bit sub-range for pools)
+    uint64_t nonce_fixed; // pool extranonce in the high bits (0 for solo)
     uint batch;
 } pc;
 
@@ -93,7 +95,9 @@ void main() {
     if (idx >= pc.batch) {
         return;
     }
-    uint64_t nonce = pc.start_nonce + uint64_t(idx);
+    // Effective nonce = miner-controlled bits of (start + idx), OR'd with the pool extranonce.
+    // For solo mining nonce_mask is all-ones and nonce_fixed is 0, so this is just start + idx.
+    uint64_t nonce = ((pc.start_nonce + uint64_t(idx)) & pc.nonce_mask) | pc.nonce_fixed;
 
     // 1. PowHash sponge: a = powP ^ (header || nonce), keccakf, take first 4 words.
     uint64_t a[25];

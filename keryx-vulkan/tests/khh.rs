@@ -84,9 +84,17 @@ fn le_leq256(a: &[u64; 4], b: &[u64; 4]) -> bool {
     true
 }
 
-fn host_lowest_winner(header: &[u64; 9], target: &[u64; 4], mat: &[u32; MATRIX_LEN], start: u64, batch: u32) -> Option<u64> {
+fn host_lowest_winner(
+    header: &[u64; 9],
+    target: &[u64; 4],
+    mat: &[u32; MATRIX_LEN],
+    start: u64,
+    batch: u32,
+    mask: u64,
+    fixed: u64,
+) -> Option<u64> {
     for i in 0..batch as u64 {
-        let nonce = start + i;
+        let nonce = ((start + i) & mask) | fixed; // effective nonce (extranonce-masked)
         if le_leq256(&heavy_hash(&pow_hash(header, nonce), mat), target) {
             return Some(nonce);
         }
@@ -127,7 +135,7 @@ fn vulkan_khh_matches_host_reference() {
         let host_pow = heavy_hash(&pow_hash(&header, n0), &matrix);
         let always = [u64::MAX; 4];
         gpu.upload_block(&matrix, header, always);
-        assert_eq!(gpu.mine(n0, 1), Some(n0), "trial {trial}: any-target single nonce must win");
+        assert_eq!(gpu.mine(n0, 1, u64::MAX, 0), Some(n0), "trial {trial}: any-target single nonce must win");
 
         // Host pow distribution over the batch → choose meaningful targets.
         let mut finals: Vec<[u64; 4]> = (0..batch as u64)
@@ -146,9 +154,20 @@ fn vulkan_khh_matches_host_reference() {
         let median = finals[finals.len() / 2];
         for target in [impossible, median, always] {
             gpu.upload_block(&matrix, header, target);
-            let host = host_lowest_winner(&header, &target, &matrix, start, batch);
-            let got = gpu.mine(start, batch);
+            let host = host_lowest_winner(&header, &target, &matrix, start, batch, u64::MAX, 0);
+            let got = gpu.mine(start, batch, u64::MAX, 0);
             assert_eq!(got, host, "trial {trial}: GPU winner {got:?} != host {host:?}");
+        }
+
+        // Pool extranonce: miner controls the low 20 bits; the extranonce sits in the high bits.
+        let mask: u64 = (1 << 20) - 1;
+        let fixed: u64 = 0xABCDu64 << 20;
+        gpu.upload_block(&matrix, header, always);
+        let host_m = host_lowest_winner(&header, &always, &matrix, start, batch, mask, fixed);
+        let got_m = gpu.mine(start, batch, mask, fixed);
+        assert_eq!(got_m, host_m, "trial {trial}: masked GPU winner {got_m:?} != host {host_m:?}");
+        if let Some(n) = got_m {
+            assert_eq!(n & !mask, fixed, "winning nonce must carry the extranonce in its high bits");
         }
         let _ = host_pow;
     }

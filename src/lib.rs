@@ -14,6 +14,16 @@ use libloading::{Library, Symbol};
 
 pub type Error = Box<dyn StdError + Send + Sync + 'static>;
 
+/// PoW-only test mode (env `KERYX_POW_ONLY=1`): skip OPoI model prefetch + the inference probe and
+/// bypass the "no models ready = no mining" gate, so the miner can grind PoW shares against a pool
+/// without llama-server or downloaded models. For testing the GPU PoW path only — production
+/// mining still requires OPoI inference.
+pub fn pow_only() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("KERYX_POW_ONLY").map(|v| !v.is_empty() && v != "0").unwrap_or(false))
+}
+
 #[derive(Default)]
 pub struct PluginManager {
     plugins: Vec<Box<dyn Plugin>>,

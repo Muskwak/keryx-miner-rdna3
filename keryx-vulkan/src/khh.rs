@@ -11,14 +11,16 @@ const KHH_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/khh.spv"));
 pub const MATRIX_LEN: usize = 64 * 64;
 const NO_WINNER: u32 = 0xFFFF_FFFF;
 
-/// Push-constant block — must match the `Push` block in `khh.comp` (header[9]+target[4]+start are
-/// u64 at 0..112, batch u32 at 112; std430 rounds the block to 120 bytes via the trailing pad).
+/// Push-constant block — must match the `Push` block in `khh.comp`: eleven u64 (header[9],
+/// target[4], start, nonce_mask, nonce_fixed) at 0..128, batch u32 at 128; padded to 136.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct KhhPush {
     header: [u64; 9],
     target: [u64; 4],
     start_nonce: u64,
+    nonce_mask: u64,
+    nonce_fixed: u64,
     batch: u32,
     _pad: u32,
 }
@@ -56,20 +58,31 @@ impl KhhGpu {
         self.target = target;
     }
 
-    /// Search nonces `[start, start + batch)`. Returns the lowest winning nonce, or None.
-    pub fn mine(&self, start: u64, batch: u32) -> Option<u64> {
+    /// Search the nonce batch starting at `start`. The effective nonce per lane is
+    /// `((start + idx) & nonce_mask) | nonce_fixed` — pass `nonce_mask = u64::MAX`, `nonce_fixed = 0`
+    /// for solo, or the pool's extranonce sub-range for shares. Returns the lowest winning effective
+    /// nonce, or None.
+    pub fn mine(&self, start: u64, batch: u32, nonce_mask: u64, nonce_fixed: u64) -> Option<u64> {
         if batch == 0 {
             return None;
         }
         self.vk.write_buffer(&self.winner, &NO_WINNER.to_le_bytes());
-        let push = KhhPush { header: self.header, target: self.target, start_nonce: start, batch, _pad: 0 };
+        let push = KhhPush {
+            header: self.header,
+            target: self.target,
+            start_nonce: start,
+            nonce_mask,
+            nonce_fixed,
+            batch,
+            _pad: 0,
+        };
         let groups = batch.div_ceil(64);
         self.vk.dispatch(&self.kernel, &[&self.matrix, &self.winner], push_bytes(&push), groups);
         let mut out = [0u8; 4];
         self.vk.read_buffer(&self.winner, &mut out);
         match u32::from_le_bytes(out) {
             NO_WINNER => None,
-            offset => Some(start + offset as u64),
+            offset => Some(((start + offset as u64) & nonce_mask) | nonce_fixed),
         }
     }
 }

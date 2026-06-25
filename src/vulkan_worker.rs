@@ -103,12 +103,11 @@ impl Worker for VulkanKhhWorker {
         self.gpu.upload_block(&mat, header, *target);
     }
 
-    fn calculate_hash(&mut self, _nonces: Option<&Vec<u64>>, _nonce_mask: u64, _nonce_fixed: u64) {
-        // Solo full-block mining: contiguous nonce range from a moving cursor. (Applying
-        // nonce_mask/nonce_fixed inside the kernel for pool shares is a later refinement; the
-        // primary RDNA3 path is solo, where nonce_mask is all-ones and nonce_fixed is 0.)
+    fn calculate_hash(&mut self, _nonces: Option<&Vec<u64>>, nonce_mask: u64, nonce_fixed: u64) {
+        // The kernel forms each effective nonce as ((cursor + idx) & nonce_mask) | nonce_fixed, so
+        // this honours both solo mining (mask all-ones, fixed 0) and a pool's extranonce sub-range.
         let start = self.nonce_cursor;
-        self.last_winner = self.gpu.mine(start, self.workload as u32).unwrap_or(0);
+        self.last_winner = self.gpu.mine(start, self.workload as u32, nonce_mask, nonce_fixed).unwrap_or(0);
         self.nonce_cursor = self.nonce_cursor.wrapping_add(self.workload as u64);
     }
 
