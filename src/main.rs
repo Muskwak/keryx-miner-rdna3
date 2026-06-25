@@ -436,15 +436,31 @@ async fn main() -> Result<(), Error> {
     if keryx_miner::pow_only() {
         info!("PoW-only mode (KERYX_POW_ONLY): skipping OPoI model prefetch + inference probe.");
     } else {
-    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await {
-        Ok(Ok(())) => log::debug!("Legacy model files ready."),
-        Ok(Err(e)) => {
-            error!("Model prefetch failed — refusing to mine without inference capability: {}", e);
-            return Err(e.into());
-        }
-        Err(e) => {
-            error!("Model prefetch task panicked: {}", e);
-            return Err(e.into());
+    // KERYX_SKIP_LEGACY_MODELS=1 — don't download the pre-fork (legacy) lineup. Useful when you
+    // only intend to mine post-fork PoM and don't want to fetch models that retire at H. Pre-fork
+    // OPoI mining is then DISABLED (the gate has no ready legacy model); the uncensored lineup still
+    // downloads and swaps in at H, so PoM mining starts on schedule.
+    let skip_legacy = std::env::var("KERYX_SKIP_LEGACY_MODELS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if skip_legacy {
+        log::warn!(
+            "KERYX_SKIP_LEGACY_MODELS set — skipping the legacy lineup ({} model(s)). Pre-fork OPoI \
+             mining DISABLED; PoM mining starts at DAA {} once the uncensored lineup swaps in.",
+            specs_v1.len(),
+            keryx_miner::models::OPOI_V2_ACTIVATION_DAA
+        );
+    } else {
+        match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await {
+            Ok(Ok(())) => log::debug!("Legacy model files ready."),
+            Ok(Err(e)) => {
+                error!("Model prefetch failed — refusing to mine without inference capability: {}", e);
+                return Err(e.into());
+            }
+            Err(e) => {
+                error!("Model prefetch task panicked: {}", e);
+                return Err(e.into());
+            }
         }
     }
     match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v2)).await {
