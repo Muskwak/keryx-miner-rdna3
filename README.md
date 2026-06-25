@@ -1,92 +1,73 @@
-# Keryx Miner
+# Keryx Miner — RDNA3 / Vulkan fork
 
-A high-performance miner for **Keryx**, combining GPU PoW (kHeavyHash) with on-chain AI inference (OPoI — Optimistic Proof of Inference).
+A fork of [keryx-miner](https://github.com/Keryx-Labs/keryx-miner) that runs **entirely on AMD
+RDNA3 GPUs (e.g. Radeon RX 7900 XT/XTX) via Vulkan** — no CUDA, no OpenCL, no CPU compute. It
+combines GPU PoW (kHeavyHash), GPU Proof-of-Model possession mining (PoM), and on-chain AI
+inference (OPoI — Optimistic Proof of Inference).
 
----
-
-## Precompiled Binaries
-
-Download the latest release from the [Releases page](https://github.com/Keryx-Labs/keryx-miner/releases).
-
----
-
-## Build from Source
-
-### Standard build (PoW only, no inference)
-
-Requires: Rust + Cargo ([rustup.rs](https://rustup.rs/)), `protoc` (`protobuf-compiler`)
-
-```bash
-git clone https://github.com/Keryx-Labs/keryx-miner.git
-cd keryx-miner
-cargo build --release --bin keryx-miner
-```
-
-Binary: `target/release/keryx-miner`
+> Upstream is NVIDIA/CUDA-only (the engine is candle + CUDA, and the build needs `nvcc`). This fork
+> replaces every GPU compute path with Vulkan and runs the OPoI models through a prebuilt
+> **llama.cpp Vulkan** server, so the miner builds and runs on an AMD-only host.
 
 ---
 
-### CUDA build (PoW + GPU inference)
+## What runs where
 
-The inference engine (candle) builds with the **CUDA 12.x** toolkit. We recommend **CUDA 12.2**: nvcc 12.2 emits kernels that JIT on **NVIDIA driver ≥ 535**, whereas 12.6 needs driver ≥ 560. Building with 12.2 runs on the widest range of hosts and mining rigs (HiveOS commonly ships driver 535.x) at no performance cost.
+| Workload | Backend | Notes |
+|---|---|---|
+| **PoW** (kHeavyHash) | Vulkan compute shader | `keccak-f1600 → 64×64 matmul → wave_mix → keccak`. Bit-exact vs the host reference, verified on a 7900 XT. |
+| **PoM** (possession walk) | Vulkan compute shader | walk over the model weights resident in a GPU storage buffer. Bit-exact vs `pom::walk_final`, verified on a 7900 XT. |
+| **OPoI inference** (Dolphin-8B / Qwen3-32B / Gemma / Llama) | prebuilt **llama.cpp Vulkan** `llama-server` | launched as a child process with all layers offloaded (`-ngl 999`); the miner talks to it over localhost HTTP. |
+| **OPoI fraud-proof commitment** | CPU (integer) | `model_fixed::forward` — a deterministic, bit-exact 32-byte fold required by consensus. Not a GPU/LLM workload; unchanged. |
 
-#### Option A — CUDA 12.2 toolkit installed on host (recommended)
+The custom kernels live in the [`keryx-vulkan`](keryx-vulkan/) crate (uses [`ash`](https://crates.io/crates/ash);
+shaders compiled GLSL→SPIR-V with `glslc`). Both kernels have bit-exactness tests that run on the
+real GPU (`cargo test -p keryx-vulkan`).
 
-Install the toolkit side-by-side (runfile, toolkit-only, no driver), then point the build at it:
+---
+
+## Requirements
+
+**Build:**
+- Rust + Cargo ([rustup.rs](https://rustup.rs/))
+- `protoc` (protobuf compiler)
+- **Vulkan SDK** — provides `glslc`, used at build time to compile the compute shaders to SPIR-V.
+  Set `VULKAN_SDK` (the installer does this) or put `glslc` on `PATH`, or point `GLSLC` at it.
+
+**Run:**
+- An AMD RDNA3 GPU + recent driver (the Vulkan runtime loader `vulkan-1` ships with the AMD
+  Adrenalin / Mesa RADV driver — no Vulkan SDK needed at runtime).
+- A **prebuilt llama.cpp `llama-server` (Vulkan build)** — see [Inference setup](#inference-setup).
+
+---
+
+## Build from source
 
 ```bash
-# one-time: install the CUDA 12.2 toolkit to ~/cuda-12.2 (no driver, no root needed)
-wget https://developer.download.nvidia.com/compute/cuda/12.2.2/local_installers/cuda_12.2.2_535.104.05_linux.run
-bash cuda_12.2.2_535.104.05_linux.run --silent --toolkit --toolkitpath="$HOME/cuda-12.2" --override
-
-cd keryx-miner
-CUDA_COMPUTE_CAP=86 \
-  CUDA_ROOT="$HOME/cuda-12.2" CUDA_PATH="$HOME/cuda-12.2" \
-  PATH="$HOME/cuda-12.2/bin:$PATH" \
-  cargo build --release --bin keryx-miner
+git clone <this-fork> keryx-miner-rdna3
+cd keryx-miner-rdna3
+cargo build --release
 ```
 
-Binary: `target/release/keryx-miner`
+Binary: `target/release/keryx-miner` (`.exe` on Windows). No `nvcc`, no CUDA toolkit, no model
+SDKs are required.
 
-> Compiling with CUDA 12.2 requires **GCC ≤ 12** (Ubuntu 22.04 / GCC 11 works out of the box). On newer hosts use Option B.
+---
 
-#### Option B — CUDA 13.x or incompatible gcc on host (build via container)
+## Inference setup
 
-If your system has CUDA 13.x or gcc 13+ (e.g. Fedora 40+, Ubuntu 25+), build inside a CUDA 12.2 container. The binary runs on the host via driver forward-compatibility.
+OPoI inference is mandatory, and this fork serves it through `llama-server` (Vulkan). Download the
+prebuilt release for your OS from the
+[llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) — the **Vulkan** asset, e.g.
+`llama-b####-bin-win-vulkan-x64.zip` on Windows — and make `llama-server` discoverable in one of:
 
-Requires: [Podman](https://podman.io/) (rootless) or Docker, NVIDIA driver ≥ 535.
+1. `<miner_dir>/llama/llama-server[.exe]`  (next to the miner binary), **or**
+2. `<miner_dir>/llama-server[.exe]`, **or**
+3. on `PATH`, **or**
+4. point `KERYX_LLAMA_SERVER` at the full path.
 
-```bash
-cd keryx-miner
-podman run --rm --security-opt label=disable \
-  -v "$PWD":/src -w /src \
-  -e CUDA_COMPUTE_CAP=86 \
-  -e CARGO_TARGET_DIR=/src/target-cuda \
-  docker.io/nvidia/cuda:12.2.2-devel-ubuntu22.04 \
-  bash -c '
-    apt-get update -qq && apt-get install -y -qq \
-      curl build-essential pkg-config libssl-dev ca-certificates protobuf-compiler >/dev/null 2>&1
-    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null 2>&1
-    . "$HOME/.cargo/env"
-    export CUDA_PATH=/usr/local/cuda PROTOC=/usr/bin/protoc
-    cargo build --release --bin keryx-miner'
-```
-
-Binary: `target-cuda/release/keryx-miner`
-
-> **Always pass `-e CUDA_COMPUTE_CAP`.** The container does **not** inherit your host shell env, so you must set the compute cap with `-e` (as above). If you omit it, `candle-kernels` auto-detects the installed GPU and a Blackwell card resolves to `100` — which nvcc 12.2 rejects (`nvcc cannot target gpu arch 100`). On a 5090, set `-e CUDA_COMPUTE_CAP=89` (not `100`). If a previous run already cached the wrong value, clear the build dir first: `rm -rf target-cuda`.
-
-> **Runtime dependencies.** PoW needs only `libcuda.so.1` (the driver). GPU **inference** additionally `dlopen`s `libcublas.so.12` and `libcurand.so.10` at runtime, so the host must have the matching CUDA 12.2 runtime libs (`libcublas-12-2`, `libcurand-12-2`). On HiveOS the miner installs and registers them automatically on first run; on other hosts install them via your package manager or the CUDA 12.2 toolkit.
-
-**CUDA_COMPUTE_CAP by GPU generation:**
-
-| GPU generation | Compute cap |
-|----------------|-------------|
-| RTX 30xx (Ampere) | `86` |
-| RTX 40xx (Ada Lovelace) | `89` |
-| RTX 50xx (Blackwell) | `89` |
-
-> **Blackwell (RTX 50xx) note.** The CUDA 12.2 toolkit cannot emit native `sm_100`/`sm_120` SASS (that needs CUDA ≥ 12.8), so do **not** set `CUDA_COMPUTE_CAP=100` with Option A/B — the build will fail. Use `89`: the `sm_89` PTX JIT-forwards to Blackwell at runtime via the driver, at no performance cost for these kernels. A native `sm_120` build would require a CUDA ≥ 12.8 toolchain and is currently untested.
+The miner launches it automatically with full GPU offload and serves the active model tier. The
+GGUF model files are downloaded on demand over IPFS on first run (same as upstream).
 
 ---
 
@@ -98,26 +79,46 @@ Binary: `target-cuda/release/keryx-miner`
 
 ### Inference tiers (OPoI)
 
-| Flag | Models supported | Min VRAM |
-|------|-----------------|----------|
-| *(none)* | TinyLlama 1.1B + DeepSeek-R1-8B | 8 GB |
-| `--light` | TinyLlama 1.1B only | 4 GB |
-| `--high` | TinyLlama 1.1B + DeepSeek-R1-8B + DeepSeek-R1-32B | 24 GB |
-| `--very-high` | All 4 models (+ LLaMA-3.3-70B) | 32 GB |
+| Flag | Models | Min VRAM | Fits a 7900 XT (20 GB)? |
+|------|--------|----------|--------------------------|
+| `--light` | Gemma-3-4B | 4 GB | ✅ |
+| *(default)* | Gemma-3-4B + Dolphin-8B | 8 GB | ✅ |
+| `--high` | + Qwen3-32B (Q4_K_M) | 24 GB | tight / no |
+| `--very-high` | Llama-3.3-70B | 48 GB | no |
 
-Models are loaded **on demand** when a request arrives and cached between requests. Mining pauses during inference, then resumes automatically.
-
-To run without inference (PoW only):
-
-```bash
-./keryx-miner --mining-address keryx:YOUR_ADDRESS --no-opoi
-```
+The miner is **GPU-only by default** (no CPU mining threads); pass `--mining-threads N` to add CPU
+PoW workers if you want them.
 
 ### All options
 
 ```bash
 ./keryx-miner --help
 ```
+
+### Useful environment variables
+
+| Var | Meaning |
+|-----|---------|
+| `KERYX_LLAMA_SERVER` | full path to the `llama-server` (Vulkan) binary |
+| `KERYX_VULKAN_WORKLOAD` | nonces per PoW dispatch (default `1048576`) |
+| `GLSLC` / `VULKAN_SDK` | (build only) locate `glslc` for shader compilation |
+
+---
+
+## Status & limitations
+
+- ✅ **Verified on a 7900 XT:** both compute kernels are bit-exact against the host/`keccak`
+  references; the full miner builds clean and the integrated Vulkan probe detects the GPU.
+- ⏳ **Live end-to-end mining** (against a real Keryx node, with `llama-server` + downloaded models)
+  has not been exercised in this environment — bring your own node/models to validate.
+- **PoM weight blob** is currently uploaded to a host-visible buffer. That is correct but reads
+  over PCIe; a device-local (VRAM) staging upload is the next performance step for the PoM tier.
+- **Pool shares:** the Vulkan PoW worker mines a contiguous nonce range (solo full-block). Applying
+  `nonce_mask`/`nonce_fixed` inside the kernel for pool shares is a follow-up; solo PoM/PoW is the
+  primary RDNA3 path.
+- **VRAM capability gate:** the upstream model-vs-VRAM filter uses `nvidia-smi` and no-ops on AMD,
+  so announce only tiers your card can actually serve (a 7900 XT comfortably runs `--light` and the
+  default tier).
 
 ---
 
@@ -126,10 +127,6 @@ To run without inference (PoW only):
 * **Website:** [keryx-labs.com](https://keryx-labs.com)
 * **X (Twitter):** [@Keryx_Labs](https://x.com/Keryx_Labs)
 * **Discord:** [Join the Community](https://discord.gg/U9eDmBUKTF)
-
----
-
-> "Intelligence is the message. Keryx is the messenger."
 
 ---
 
