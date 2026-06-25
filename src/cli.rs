@@ -159,17 +159,8 @@ impl Opt {
             self.num_threads = Some(0);
         }
 
-        let miner_network = self.mining_address.as_deref().and_then(|a| a.split(':').next());
-        self.devfund_address = String::from("keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte");
-        let devfund_network = self.devfund_address.split(':').next();
-        if miner_network.is_some() && devfund_network.is_some() && miner_network != devfund_network {
-            self.devfund_percent = 0;
-            log::info!(
-                "Mining address ({}) and devfund ({}) are not from the same network. Disabling devfund.",
-                miner_network.unwrap(),
-                devfund_network.unwrap()
-            )
-        }
+        // RDNA3 fork: devfund disabled — 0% of blocks are diverted; all rewards go to the miner.
+        self.devfund_percent = 0;
         Ok(())
     }
 
