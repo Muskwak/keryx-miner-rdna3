@@ -515,15 +515,32 @@ async fn main() -> Result<(), Error> {
     // resets the delay back to the minimum.
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+    // Some pools (e.g. suprnova) reject an in-process reconnect while the previous worker session
+    // is still registered, yet accept a brand-new process — the OS hard-closes the old socket on
+    // exit. So after a few short-lived sessions in a row, exit(1) and let the supervisor
+    // (start-miner.bat / HiveOS) relaunch us clean, instead of looping uselessly.
+    const MAX_SHORT_SESSIONS: u32 = 3;
+    let mut short_sessions: u32 = 0;
     loop {
         let started = std::time::Instant::now();
         match client_main(&opt, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone()).await {
             Ok(_) => info!("Client closed gracefully"),
             Err(e) => error!("Client closed with error {:?}", e),
         }
-        // Healthy session (stayed connected a while) → reset; rapid drops → grow the delay.
-        if started.elapsed() >= Duration::from_secs(60) {
-            backoff = Duration::from_secs(1);
+        if started.elapsed() >= HEALTHY_SESSION {
+            backoff = Duration::from_secs(1); // a long, healthy session → reset
+            short_sessions = 0;
+        } else {
+            short_sessions += 1;
+            if short_sessions >= MAX_SHORT_SESSIONS {
+                error!(
+                    "{} short-lived sessions in a row — the pool is refusing in-process reconnects. \
+                     Exiting for a clean supervised restart.",
+                    short_sessions
+                );
+                std::process::exit(1);
+            }
         }
         info!("Client closed, reconnecting in {}s", backoff.as_secs());
         sleep(backoff);
