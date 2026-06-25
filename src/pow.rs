@@ -34,6 +34,9 @@ pub enum BlockSeed {
         nonce_mask: u64,
         nonce_fixed: u64,
         hash: Option<String>,
+        /// PoM (post-fork): borsh-encoded possession proof for this share. Empty pre-fork /
+        /// legacy kHeavyHash. The stratum client hex-encodes it into `mining.submit` params[5].
+        pom_proof: Vec<u8>,
     },
 }
 
@@ -207,7 +210,10 @@ impl State {
                 header.nonce = nonce;
                 block.pom_proof = bytes; // plain bytes field (empty = none on the wire)
             }
-            BlockSeed::PartialBlock { .. } => return None,
+            BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut pom_proof, .. } => {
+                *header_nonce = nonce;
+                *pom_proof = bytes; // stratum client hex-encodes this into mining.submit params[5]
+            }
         }
         Some(block_seed)
     }
