@@ -1,0 +1,19 @@
+[package]
+name = "keryx-vulkan"
+version = "0.1.0"
+edition = "2021"
+description = "Vulkan compute backend for the Keryx RDNA3 miner (PoM walk + kHeavyHash PoW)"
+license = "MIT/Apache-2.0"
+
+[dependencies]
+# ash is a thin, dynamically-loaded Vulkan binding — no Vulkan SDK needed to BUILD, only the
+# vulkan-1 loader (shipped with the AMD driver) to RUN. Perfect for a no-toolchain RDNA3 target.
+ash = "0.38"
+
+[dev-dependencies]
+rand = "0.8"
+
+# Standalone during bring-up: detaches this crate from the miner workspace (whose root package
+# still pulls candle/CUDA) so it builds and tests on an AMD-only host. Folded into the workspace
+# once the main crate is de-CUDA'd.
+[workspace]
