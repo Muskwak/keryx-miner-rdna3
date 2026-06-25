@@ -11,7 +11,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_integer_dot_product : require
 
-layout(local_size_x = 64) in;
+layout(local_size_x = 256) in;
 
 // 64x64 matrix of 4-bit entries, packed 4 row-major entries per u32 (entry e at byte e%4) — the
 // layout the 4x8-bit packed dot product consumes. 64x64 entries => 1024 u32.
@@ -135,7 +135,9 @@ void main() {
         }
         nibv[k] = v;
     }
-    uint pbytes[32];
+    // Matmul → straight into the 4 LE output words (no 32-byte scratch array). Output byte i lands
+    // in word i/8 at byte i%8, XOR'd with the PoW-hash byte — exactly the scalar form, fewer VGPRs.
+    uint64_t w[4] = uint64_t[4](0UL, 0UL, 0UL, 0UL);
     for (uint i = 0u; i < 32u; ++i) {
         uint sum1 = 0u;
         uint sum2 = 0u;
@@ -145,17 +147,7 @@ void main() {
         }
         uint matbyte = ((sum1 >> 10u) << 4u) | (sum2 >> 10u);
         uint hbyte = uint((pw[i >> 3u] >> (8u * (i & 7u))) & 0xFFUL);
-        pbytes[i] = matbyte ^ hbyte;
-    }
-
-    // Pack the 32 product bytes into 4 LE u64 words.
-    uint64_t w[4];
-    for (uint k = 0u; k < 4u; ++k) {
-        uint64_t v = 0UL;
-        for (uint b = 0u; b < 8u; ++b) {
-            v |= uint64_t(pbytes[k * 8u + b]) << (8u * b);
-        }
-        w[k] = v;
+        w[i >> 3u] |= uint64_t((matbyte ^ hbyte) & 0xFFu) << (8u * (i & 7u));
     }
 
     // 3. wave_mix: 4-round ARX (rotations 17,47,31,13; pairs (w0,w2) then (w1,w3)).
@@ -166,12 +158,12 @@ void main() {
         w[3] = rotl64(w[3] + w[0], 13u) ^ WAVE_MIX_KEYS[(r + 3u) & 3u];
     }
 
-    // 4. HeavyHash sponge over the wave-mixed 32 bytes (rest zero-padded).
-    uint64_t h[25];
-    for (uint i = 0u; i < 4u; ++i) h[i] = heavyP[i] ^ w[i];
-    for (uint i = 4u; i < 25u; ++i) h[i] = heavyP[i];
-    keccakf(h);
-    uint64_t f0 = h[0], f1 = h[1], f2 = h[2], f3 = h[3];
+    // 4. HeavyHash sponge over the wave-mixed 32 bytes — reuse `a` (the PoW-hash state is dead now)
+    //    instead of a second 25-word state array, to keep register pressure down.
+    for (uint i = 0u; i < 4u; ++i) a[i] = heavyP[i] ^ w[i];
+    for (uint i = 4u; i < 25u; ++i) a[i] = heavyP[i];
+    keccakf(a);
+    uint64_t f0 = a[0], f1 = a[1], f2 = a[2], f3 = a[3];
 
     // 5. final <= target  (unsigned 256-bit LE, word[3] most significant).
     bool le;

@@ -84,7 +84,7 @@ impl KhhGpu {
             batch,
             _pad: 0,
         };
-        let groups = batch.div_ceil(64);
+        let groups = batch.div_ceil(256); // must match local_size_x in khh.comp
         self.vk.dispatch(&self.kernel, &[&self.matrix, &self.winner], push_bytes(&push), groups);
         let mut out = [0u8; 4];
         self.vk.read_buffer(&self.winner, &mut out);
