@@ -37,6 +37,11 @@ const NO_WINNER: u32 = 0xFFFF_FFFF;
 /// chunk to (shard, offset) with a shift + mask instead of 64-bit divide.
 const SHARD_CHUNKS: u64 = 1 << 25;
 
+/// Max nonces per GPU dispatch. The walk is latency-bound (256 dependent reads/nonce), so a full
+/// 1<<20 batch in one dispatch can exceed the Windows TDR watchdog (~2 s) and lose the device.
+/// 65,536 keeps each dispatch to a few ms on device-local VRAM while staying far above launch cost.
+const MAX_DISPATCH_NONCES: u32 = 1 << 16;
+
 /// Resident GPU PoM miner: the weight blob lives in a storage buffer; `mine` re-dispatches the
 /// walk over nonce batches. Build once per mining tier (the weight blob is large).
 pub struct PomWalkGpu {
@@ -84,8 +89,9 @@ impl PomWalkGpu {
             let first_word = (s * shard_chunks * 4) as usize;
             let last_word = (((s + 1) * shard_chunks).min(n_chunks) * 4) as usize;
             let slice = &weight_words[first_word..last_word];
-            let (buf, addr) = vk.create_device_address_buffer(slice.len() as u64 * 8)?;
-            vk.write_buffer(&buf, words_as_bytes(slice));
+            // Device-local VRAM (staged copy): the walk's random reads are ~100x faster here than
+            // host-visible memory — host-visible overran the TDR watchdog → DEVICE_LOST.
+            let (buf, addr) = vk.create_device_local_address_buffer(words_as_bytes(slice))?;
             shards.push(buf);
             addrs.push(addr);
         }
@@ -108,31 +114,38 @@ impl PomWalkGpu {
     }
 
     /// Search nonces `[start, start + batch)`. Returns the lowest winning nonce, or None.
+    ///
+    /// The batch is ground in `MAX_DISPATCH_NONCES`-sized sub-dispatches, in increasing nonce order,
+    /// so no single GPU dispatch runs long enough to trip the Windows TDR watchdog (DEVICE_LOST).
+    /// Sub-batches are ascending, so the first one with any winner holds the global lowest nonce —
+    /// returning there is identical to grinding the whole batch, and skips the rest.
     pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
-        if batch == 0 {
-            return None;
-        }
-        self.vk.write_buffer(&self.winner, &NO_WINNER.to_le_bytes());
-        let push = PomPush {
-            p: words4(pre_pow_hash),
-            t: words4(target_le),
-            timestamp,
-            n_chunks: self.n_chunks,
-            start_nonce: start,
-            shard_mask: self.shard_chunks - 1,
-            k: POM_WALK_STEPS,
-            batch,
-            shard_shift: self.shard_chunks.trailing_zeros(),
-        };
-        let groups = batch.div_ceil(64); // local_size_x = 64
-        self.vk.dispatch(&self.kernel, &[&self.winner, &self.addr_table], push_bytes(&push), groups);
+        let mut done: u32 = 0;
+        while done < batch {
+            let sub = (batch - done).min(MAX_DISPATCH_NONCES);
+            self.vk.write_buffer(&self.winner, &NO_WINNER.to_le_bytes());
+            let push = PomPush {
+                p: words4(pre_pow_hash),
+                t: words4(target_le),
+                timestamp,
+                n_chunks: self.n_chunks,
+                start_nonce: start + done as u64,
+                shard_mask: self.shard_chunks - 1,
+                k: POM_WALK_STEPS,
+                batch: sub,
+                shard_shift: self.shard_chunks.trailing_zeros(),
+            };
+            let groups = sub.div_ceil(64); // local_size_x = 64
+            self.vk.dispatch(&self.kernel, &[&self.winner, &self.addr_table], push_bytes(&push), groups);
 
-        let mut out = [0u8; 4];
-        self.vk.read_buffer(&self.winner, &mut out);
-        match u32::from_le_bytes(out) {
-            NO_WINNER => None,
-            offset => Some(start + offset as u64),
+            let mut out = [0u8; 4];
+            self.vk.read_buffer(&self.winner, &mut out);
+            if let offset @ 0..=0xFFFF_FFFE = u32::from_le_bytes(out) {
+                return Some(start + done as u64 + offset as u64);
+            }
+            done += sub;
         }
+        None
     }
 }
 

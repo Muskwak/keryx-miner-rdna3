@@ -202,10 +202,7 @@ impl Vk {
         unsafe {
             // A single allocation can't exceed maxMemoryAllocationSize. Surface a clear error
             // instead of the driver's opaque VK_ERROR_UNKNOWN if a future tier's blob is too large.
-            let mut limits11 = vk::PhysicalDeviceVulkan11Properties::default();
-            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut limits11);
-            self.instance.get_physical_device_properties2(self.pdevice, &mut props2);
-            let max_alloc = limits11.max_memory_allocation_size;
+            let max_alloc = self.max_memory_allocation_size();
             if max_alloc != 0 && size > max_alloc {
                 return Err(format!(
                     "weight blob {size} bytes exceeds maxMemoryAllocationSize {max_alloc} bytes"
@@ -240,6 +237,128 @@ impl Vk {
                 .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer));
             Ok((GpuBuffer { buffer, memory, size }, address))
         }
+    }
+
+    /// Allocate a **DEVICE_LOCAL** buffer that exposes a GPU device address, and fill it from `data`
+    /// via a host-visible staging copy. Device-local is essential for the PoM walk: its 256
+    /// data-dependent reads per nonce are ~100x faster from VRAM than from host-visible memory over
+    /// PCIe — a host-visible blob made a single batch overrun the Windows TDR watchdog (DEVICE_LOST).
+    pub fn create_device_local_address_buffer(&self, data: &[u8]) -> Result<(GpuBuffer, u64), String> {
+        let size = data.len() as u64;
+        assert!(size > 0, "zero-size buffer");
+        unsafe {
+            let max_alloc = self.max_memory_allocation_size();
+            if max_alloc != 0 && size > max_alloc {
+                return Err(format!(
+                    "weight shard {size} bytes exceeds maxMemoryAllocationSize {max_alloc} bytes"
+                ));
+            }
+
+            // Device-local destination: read by the shader via its device address, written by copy.
+            let info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = self.device.create_buffer(&info, None).map_err(|e| e.to_string())?;
+            let req = self.device.get_buffer_memory_requirements(buffer);
+            let mt = self.find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let memory = self
+                .device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(mt)
+                        .push_next(&mut flags),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            self.device.bind_buffer_memory(buffer, memory, 0).map_err(|e| e.to_string())?;
+
+            // Host-visible staging source: fill it, copy to VRAM, then free it.
+            let staging_info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let staging = self.device.create_buffer(&staging_info, None).map_err(|e| e.to_string())?;
+            let sreq = self.device.get_buffer_memory_requirements(staging);
+            let smt = self.find_memory_type(
+                sreq.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let smem = self
+                .device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default().allocation_size(sreq.size).memory_type_index(smt),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            self.device.bind_buffer_memory(staging, smem, 0).map_err(|e| e.to_string())?;
+            let ptr = self
+                .device
+                .map_memory(smem, 0, size, vk::MemoryMapFlags::empty())
+                .map_err(|e| e.to_string())? as *mut u8;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            self.device.unmap_memory(smem);
+
+            let copy_res = self.immediate_copy(staging, buffer, size);
+            self.device.destroy_buffer(staging, None);
+            self.device.free_memory(smem, None);
+            if let Err(e) = copy_res {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+                return Err(e);
+            }
+
+            let address = self
+                .device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer));
+            Ok((GpuBuffer { buffer, memory, size }, address))
+        }
+    }
+
+    /// The device's single-allocation ceiling (`maxMemoryAllocationSize`), 0 if unreported.
+    unsafe fn max_memory_allocation_size(&self) -> u64 {
+        let mut limits11 = vk::PhysicalDeviceVulkan11Properties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut limits11);
+        self.instance.get_physical_device_properties2(self.pdevice, &mut props2);
+        limits11.max_memory_allocation_size
+    }
+
+    /// Submit a one-shot buffer→buffer copy and block until it completes.
+    unsafe fn immediate_copy(&self, src: vk::Buffer, dst: vk::Buffer, size: u64) -> Result<(), String> {
+        let cmd = self
+            .device
+            .allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+            .map_err(|e| e.to_string())?[0];
+        let cmds = [cmd];
+        let run = || -> Result<(), String> {
+            self.device
+                .begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|e| e.to_string())?;
+            self.device.cmd_copy_buffer(cmd, src, dst, &[vk::BufferCopy::default().size(size)]);
+            self.device.end_command_buffer(cmd).map_err(|e| e.to_string())?;
+            let fence = self.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| e.to_string())?;
+            let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+            let res = self
+                .device
+                .queue_submit(self.queue, &[submit], fence)
+                .map_err(|e| e.to_string())
+                .and_then(|_| self.device.wait_for_fences(&[fence], true, u64::MAX).map_err(|e| e.to_string()));
+            self.device.destroy_fence(fence, None);
+            res
+        };
+        let res = run();
+        self.device.free_command_buffers(self.cmd_pool, &cmds);
+        res
     }
 
     /// Copy `data` into a host-visible buffer (`data.len()` must be ≤ the buffer size).

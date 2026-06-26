@@ -197,3 +197,37 @@ fn vulkan_pom_walk_multishard_matches_host_reference() {
         }
     }
 }
+
+/// Exercise the sub-dispatch loop: a batch larger than one dispatch (the miner uses 1<<20; the GPU
+/// caps each dispatch internally) must still agree with the host across the dispatch boundary,
+/// including the no-winner case that grinds every sub-dispatch to completion.
+#[test]
+fn vulkan_pom_walk_spans_dispatches() {
+    let mut rng = StdRng::seed_from_u64(0x5151_2323);
+    let n_chunks: u64 = 257;
+    let words: Vec<u64> = (0..n_chunks * 4).map(|_| rng.r#gen::<u64>()).collect();
+
+    let gpu = match PomWalkGpu::new(&words, n_chunks) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: no Vulkan device available ({e})");
+            return;
+        }
+    };
+
+    // Spans 3 internal dispatches (MAX_DISPATCH_NONCES = 1<<16): exercises the `start + done` math.
+    let start: u64 = 0xAABB_CCDD_0000_0000;
+    let batch: u32 = (1 << 17) + 4096;
+    let mut pph = [0u8; 32];
+    rng.fill(&mut pph);
+    let ts: u64 = rng.r#gen();
+
+    // Impossible target → no winner anywhere, so every sub-dispatch runs and the loop returns None.
+    assert_eq!(gpu.mine(&pph, ts, &[0u8; 32], start, batch), None, "impossible target must yield None");
+
+    // Loose target → many winners; GPU must return the same global-lowest nonce the host finds.
+    let loose = [0x40u8; 32];
+    let host = host_lowest_winner(&words, n_chunks, &pph, ts, &loose, start, batch);
+    assert_eq!(gpu.mine(&pph, ts, &loose, start, batch), host, "spanning batch: GPU != host");
+    assert!(host.is_some(), "loose target should have a winner to make this meaningful");
+}
