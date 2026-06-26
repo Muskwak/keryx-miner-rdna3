@@ -81,6 +81,8 @@ pub struct ShareStats {
     pub stale: AtomicU64,
     pub low_diff: AtomicU64,
     pub duplicate: AtomicU64,
+    pub invalid_opoi: AtomicU64,
+    pub invalid_pom: AtomicU64,
     pub shares_pending: Mutex<HashMap<u32, String>>,
 }
 
@@ -90,7 +92,7 @@ impl Display for ShareStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Shares: {}{}{}{}Pending: {}",
+            "Shares: {}{}{}{}{}{}Pending: {}",
             match self.accepted.load(Ordering::SeqCst) {
                 0 => "".to_string(),
                 v => format!("Accepted: {} ", v),
@@ -106,6 +108,14 @@ impl Display for ShareStats {
             match self.duplicate.load(Ordering::SeqCst) {
                 0 => "".to_string(),
                 v => format!("Duplicate: {} ", v),
+            },
+            match self.invalid_opoi.load(Ordering::SeqCst) {
+                0 => "".to_string(),
+                v => format!("Invalid OPoI tag: {} ", v),
+            },
+            match self.invalid_pom.load(Ordering::SeqCst) {
+                0 => "".to_string(),
+                v => format!("Invalid PoM proof: {} ", v),
             },
             self.shares_pending.try_lock().unwrap().len()
         )
@@ -274,9 +284,14 @@ impl StratumHandler {
             results: HashMap::new(),
             in_progress: HashSet::new(),
         }));
+        // Stratum-spec §4.3: mining.submit param[0] must carry the SAME `.<worker>` suffix used at
+        // authorize, so the pool credits shares to the right rig. Build it once and hand it to the
+        // submit channel (register() does the equivalent for mining.authorize).
+        let submit_username =
+            if worker.is_empty() { miner_address.clone() } else { format!("{}.{}", miner_address, worker) };
         let (block_channel, block_handle) = Self::create_block_channel(
             send_channel.clone(),
-            miner_address.clone(),
+            submit_username,
             last_stratum_id.clone(),
             share_state.clone(),
             Arc::clone(&current_task_slot),
@@ -312,7 +327,7 @@ impl StratumHandler {
 
     fn create_block_channel(
         send_channel: Sender<StratumLine>,
-        miner_address: String,
+        submit_username: String,
         last_stratum_id: Arc<AtomicU32>,
         share_stats: Arc<ShareStats>,
         current_task_slot: Arc<Mutex<Option<CurrentTask>>>,
@@ -357,7 +372,7 @@ impl StratumHandler {
                         id: Some(msg_id),
                         payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
                             MiningSubmit::MiningSubmitWithPom((
-                                miner_address.clone(),
+                                submit_username.clone(),
                                 job_id,
                                 nonce_hex,
                                 opoi_tag,
@@ -374,7 +389,7 @@ impl StratumHandler {
                         id: Some(msg_id),
                         payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
                             MiningSubmit::MiningSubmitWithCID((
-                                miner_address.clone(),
+                                submit_username.clone(),
                                 job_id,
                                 nonce_hex,
                                 opoi_tag,
@@ -389,7 +404,7 @@ impl StratumHandler {
                         id: Some(msg_id),
                         payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
                             MiningSubmit::MiningSubmitWithTag((
-                                miner_address.clone(),
+                                submit_username.clone(),
                                 job_id,
                                 nonce_hex,
                                 opoi_tag,
@@ -595,6 +610,18 @@ impl StratumHandler {
                     ErrorCode::LowDifficultyShare => {
                         self.shares_stats.low_diff.fetch_add(1, Ordering::SeqCst);
                         warn!("Low difficulty share (Job id: {:?})", jobid);
+                        Ok(())
+                    }
+                    // Keryx OPoI/PoM share rejections — non-fatal, same as any rejected share.
+                    // The connection must survive; only the share is lost.
+                    ErrorCode::InvalidOpoiTag => {
+                        self.shares_stats.invalid_opoi.fetch_add(1, Ordering::SeqCst);
+                        warn!("Invalid OPoI tag, share rejected (Job id: {:?}): {}", jobid, error);
+                        Ok(())
+                    }
+                    ErrorCode::InvalidPomProof => {
+                        self.shares_stats.invalid_pom.fetch_add(1, Ordering::SeqCst);
+                        warn!("Invalid/missing PoM proof, share rejected (Job id: {:?}): {}", jobid, error);
                         Ok(())
                     }
                     ErrorCode::Unauthorized => {

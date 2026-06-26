@@ -16,6 +16,11 @@ pub enum ErrorCode {
     LowDifficultyShare = 23,
     Unauthorized = 24,
     NotSubscribed = 25,
+    // Keryx OPoI/PoM extension (stratum-spec v1.1 §error-codes). These MUST be representable:
+    // a missing variant makes serde_repr fail to deserialize the whole line, tearing down the
+    // connection and triggering a reconnect loop on every tag/proof rejection.
+    InvalidOpoiTag = 26,
+    InvalidPomProof = 27,
 }
 
 impl Display for ErrorCode {
@@ -27,6 +32,8 @@ impl Display for ErrorCode {
             ErrorCode::LowDifficultyShare => write!(f, "LowDifficultyShare"),
             ErrorCode::Unauthorized => write!(f, "Unauthorized"),
             ErrorCode::NotSubscribed => write!(f, "NotSubscribed"),
+            ErrorCode::InvalidOpoiTag => write!(f, "InvalidOpoiTag"),
+            ErrorCode::InvalidPomProof => write!(f, "InvalidPomProof"),
         }
     }
 }
