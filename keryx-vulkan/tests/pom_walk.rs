@@ -150,3 +150,50 @@ fn vulkan_pom_walk_matches_host_reference() {
     // 'max' target must always return the very first nonce.
     assert_eq!(gpu.mine(&[7u8; 32], 42, &[0xFFu8; 32], start, batch), Some(start));
 }
+
+/// Same bit-exactness check, but force a MULTI-SHARD layout (tiny shards over a 257-chunk blob) so
+/// the shard-mapping path (shift/mask + per-shard device address) is exercised without multi-GiB
+/// allocations. The host reference reads the blob contiguously; the GPU must agree across shards.
+#[test]
+fn vulkan_pom_walk_multishard_matches_host_reference() {
+    let mut rng = StdRng::seed_from_u64(0xABCD_4321);
+    let n_chunks: u64 = 257;
+    let words: Vec<u64> = (0..n_chunks * 4).map(|_| rng.r#gen::<u64>()).collect();
+
+    // 64 chunks/shard → ceil(257/64) = 5 shards, last one partial.
+    let gpu = match PomWalkGpu::new_sharded(&words, n_chunks, 64) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: no Vulkan device available ({e})");
+            return;
+        }
+    };
+    eprintln!("multi-shard PoM walk running on: {}", gpu.device_name());
+
+    let start: u64 = 0x0102_0304_0500_0000;
+    let batch: u32 = 8192;
+    for trial in 0..4 {
+        let mut pph = [0u8; 32];
+        rng.fill(&mut pph);
+        let ts: u64 = rng.r#gen();
+        let mut pows: Vec<[u8; 32]> = (0..batch as u64)
+            .map(|i| {
+                let seed = pom_block_seed(&pph, ts, start + i);
+                pom_pow_value(walk_final(seed, n_chunks, POM_WALK_STEPS, &words), &pph)
+            })
+            .collect();
+        pows.sort_by(|a, b| {
+            for i in (0..32).rev() {
+                if a[i] != b[i] {
+                    return a[i].cmp(&b[i]);
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        for target in [[0u8; 32], pows[pows.len() / 2], [0xFFu8; 32]] {
+            let host = host_lowest_winner(&words, n_chunks, &pph, ts, &target, start, batch);
+            let got = gpu.mine(&pph, ts, &target, start, batch);
+            assert_eq!(got, host, "multishard trial {trial}: GPU {got:?} != host {host:?}");
+        }
+    }
+}

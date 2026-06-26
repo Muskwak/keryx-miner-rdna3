@@ -11,8 +11,11 @@ const POM_WALK_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk.s
 /// POM_WALK_STEPS — must match `pom::POM_WALK_STEPS` and the node.
 pub const POM_WALK_STEPS: u32 = 256;
 
-/// Push-constant block — layout MUST match the `Push` block in `pom_walk.comp` (scalar std430:
-/// eleven u64 at offsets 0..88, then two u32 at 88, 92; total 96 bytes).
+/// Push-constant block — layout MUST match the `Push` block in `pom_walk.comp` (std430: twelve u64
+/// at 0..96, then three u32 at 96, 100, 104; total 112 bytes incl. tail pad). The weight blob is
+/// split into power-of-two-sized shards (each a separate device-address buffer, ≤ the 2 GiB
+/// `maxMemoryAllocationSize`); the shader maps a chunk to its shard via `shard_shift`/`shard_mask`
+/// and reads the shard's GPU address from a small bound address table.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PomPush {
@@ -21,26 +24,41 @@ struct PomPush {
     timestamp: u64,
     n_chunks: u64,
     start_nonce: u64,
+    shard_mask: u64, // chunks_per_shard - 1
     k: u32,
     batch: u32,
+    shard_shift: u32, // log2(chunks_per_shard)
 }
 
 const NO_WINNER: u32 = 0xFFFF_FFFF;
+
+/// Chunks per shard: 2^25 × 32 B = 1 GiB, comfortably under the AMD 2 GiB `maxMemoryAllocationSize`
+/// single-allocation cap, with headroom for driver overhead. Power of two so the shader maps a
+/// chunk to (shard, offset) with a shift + mask instead of 64-bit divide.
+const SHARD_CHUNKS: u64 = 1 << 25;
 
 /// Resident GPU PoM miner: the weight blob lives in a storage buffer; `mine` re-dispatches the
 /// walk over nonce batches. Build once per mining tier (the weight blob is large).
 pub struct PomWalkGpu {
     vk: Vk,
     kernel: Kernel,
-    weights: GpuBuffer,
+    shards: Vec<GpuBuffer>, // weight blob split into ≤1 GiB device-address buffers
+    addr_table: GpuBuffer,  // bound SSBO: one u64 GPU address per shard
     winner: GpuBuffer,
     n_chunks: u64,
+    shard_chunks: u64,
 }
 
 impl PomWalkGpu {
     /// Upload the canonical weight blob (`weight_words` = the model's quant bytes as little-endian
     /// u64 words, `n_chunks * 4` of them) and compile the walk kernel on the RDNA3 GPU.
     pub fn new(weight_words: &[u64], n_chunks: u64) -> Result<Self, String> {
+        Self::new_sharded(weight_words, n_chunks, SHARD_CHUNKS)
+    }
+
+    /// Like [`new`](Self::new) but with an explicit shard size (chunks per shard, power of two).
+    /// Lets tests force a multi-shard layout without multi-GiB allocations.
+    pub fn new_sharded(weight_words: &[u64], n_chunks: u64, shard_chunks: u64) -> Result<Self, String> {
         if n_chunks == 0 || weight_words.len() as u64 != n_chunks * 4 {
             return Err(format!(
                 "weight blob size mismatch: {} words for {} chunks (expected {})",
@@ -49,15 +67,35 @@ impl PomWalkGpu {
                 n_chunks * 4
             ));
         }
+        if !shard_chunks.is_power_of_two() {
+            return Err(format!("shard_chunks must be a power of two, got {shard_chunks}"));
+        }
         let vk = Vk::new()?;
         let spirv = ash::util::read_spv(&mut Cursor::new(POM_WALK_SPV)).map_err(|e| e.to_string())?;
+        // Two descriptor bindings: the winner buffer and the shard address table. The (large) weight
+        // shards are reached by device address, not bound as descriptors.
         let kernel = vk.make_kernel(&spirv, 2, std::mem::size_of::<PomPush>() as u32)?;
 
-        let weights = vk.create_buffer(weight_words.len() as u64 * 8)?;
-        vk.write_buffer(&weights, words_as_bytes(weight_words));
+        // Split the blob on chunk boundaries into device-address shards; collect their GPU addresses.
+        let n_shards = n_chunks.div_ceil(shard_chunks);
+        let mut shards: Vec<GpuBuffer> = Vec::with_capacity(n_shards as usize);
+        let mut addrs: Vec<u64> = Vec::with_capacity(n_shards as usize);
+        for s in 0..n_shards {
+            let first_word = (s * shard_chunks * 4) as usize;
+            let last_word = (((s + 1) * shard_chunks).min(n_chunks) * 4) as usize;
+            let slice = &weight_words[first_word..last_word];
+            let (buf, addr) = vk.create_device_address_buffer(slice.len() as u64 * 8)?;
+            vk.write_buffer(&buf, words_as_bytes(slice));
+            shards.push(buf);
+            addrs.push(addr);
+        }
+
+        // Address table (tiny — one u64 per shard) bound as a normal storage buffer at binding 1.
+        let addr_table = vk.create_buffer((addrs.len() * 8) as u64)?;
+        vk.write_buffer(&addr_table, words_as_bytes(&addrs));
         let winner = vk.create_buffer(4)?;
 
-        Ok(Self { vk, kernel, weights, winner, n_chunks })
+        Ok(Self { vk, kernel, shards, addr_table, winner, n_chunks, shard_chunks })
     }
 
     /// Name of the GPU the miner is running on.
@@ -81,11 +119,13 @@ impl PomWalkGpu {
             timestamp,
             n_chunks: self.n_chunks,
             start_nonce: start,
+            shard_mask: self.shard_chunks - 1,
             k: POM_WALK_STEPS,
             batch,
+            shard_shift: self.shard_chunks.trailing_zeros(),
         };
         let groups = batch.div_ceil(64); // local_size_x = 64
-        self.vk.dispatch(&self.kernel, &[&self.weights, &self.winner], push_bytes(&push), groups);
+        self.vk.dispatch(&self.kernel, &[&self.winner, &self.addr_table], push_bytes(&push), groups);
 
         let mut out = [0u8; 4];
         self.vk.read_buffer(&self.winner, &mut out);
@@ -99,7 +139,10 @@ impl PomWalkGpu {
 impl Drop for PomWalkGpu {
     fn drop(&mut self) {
         self.vk.destroy_buffer(&self.winner);
-        self.vk.destroy_buffer(&self.weights);
+        self.vk.destroy_buffer(&self.addr_table);
+        for shard in &self.shards {
+            self.vk.destroy_buffer(shard);
+        }
         self.vk.destroy_kernel(&self.kernel);
     }
 }

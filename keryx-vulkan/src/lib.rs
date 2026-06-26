@@ -94,10 +94,16 @@ impl Vk {
             // shader_int64 for the 64-bit folds; shader_integer_dot_product for the kHeavyHash
             // matmul (the hardware 4x8-bit packed dot — RDNA3's v_dot4_u32_u8).
             let features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
+            // bufferDeviceAddress: lets the PoM weight blob be read through a 64-bit pointer
+            // (GL_EXT_buffer_reference) instead of a bound storage descriptor. An 8B+ model's blob
+            // is >4 GiB, which exceeds `maxStorageBufferRange` (0xFFFFFFFF on AMD) — accessing it by
+            // device address sidesteps that per-descriptor cap. Core in Vulkan 1.2; RDNA3 supports it.
+            let mut features12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
             let mut features13 = vk::PhysicalDeviceVulkan13Features::default().shader_integer_dot_product(true);
             let dci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&qcis)
                 .enabled_features(&features)
+                .push_next(&mut features12)
                 .push_next(&mut features13);
             let device = instance
                 .create_device(pdevice, &dci, None)
@@ -181,6 +187,58 @@ impl Vk {
                 .map_err(|e| e.to_string())?;
             self.device.bind_buffer_memory(buffer, memory, 0).map_err(|e| e.to_string())?;
             Ok(GpuBuffer { buffer, memory, size })
+        }
+    }
+
+    /// Allocate a host-visible buffer that also exposes a GPU **device address**
+    /// (`VK_KHR_buffer_device_address`), returning the buffer and its 64-bit address. The shader
+    /// reads it via a `buffer_reference` pointer rather than a bound SSBO, so the buffer can exceed
+    /// the 4 GiB `maxStorageBufferRange` descriptor cap — required for the PoM weight blob of an 8B+
+    /// model (~4.6 GiB). Usage is `SHADER_DEVICE_ADDRESS` only (no `STORAGE_BUFFER`): it is never
+    /// bound as a descriptor, and dropping that usage also avoids the driver's >4 GiB storage-buffer
+    /// rejection at creation time.
+    pub fn create_device_address_buffer(&self, size: u64) -> Result<(GpuBuffer, u64), String> {
+        assert!(size > 0, "zero-size buffer");
+        unsafe {
+            // A single allocation can't exceed maxMemoryAllocationSize. Surface a clear error
+            // instead of the driver's opaque VK_ERROR_UNKNOWN if a future tier's blob is too large.
+            let mut limits11 = vk::PhysicalDeviceVulkan11Properties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut limits11);
+            self.instance.get_physical_device_properties2(self.pdevice, &mut props2);
+            let max_alloc = limits11.max_memory_allocation_size;
+            if max_alloc != 0 && size > max_alloc {
+                return Err(format!(
+                    "weight blob {size} bytes exceeds maxMemoryAllocationSize {max_alloc} bytes"
+                ));
+            }
+
+            let info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = self.device.create_buffer(&info, None).map_err(|e| e.to_string())?;
+            let req = self.device.get_buffer_memory_requirements(buffer);
+            let mt = self.find_memory_type(
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            // DEVICE_ADDRESS allocate flag is mandatory when the buffer carries SHADER_DEVICE_ADDRESS.
+            let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let memory = self
+                .device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(mt)
+                        .push_next(&mut flags),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            self.device.bind_buffer_memory(buffer, memory, 0).map_err(|e| e.to_string())?;
+            let address = self
+                .device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer));
+            Ok((GpuBuffer { buffer, memory, size }, address))
         }
     }
 
