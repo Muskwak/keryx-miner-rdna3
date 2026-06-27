@@ -39,6 +39,13 @@ pub fn is_installed() -> bool {
     MINER.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
+/// VRAM bytes occupied by the resident PoM weight blob (`n_chunks * 32`), or 0 if not installed.
+/// Inference uses this to decide whether the blob can stay resident alongside the served model
+/// instead of being unloaded + later re-staged on every challenge.
+pub fn resident_blob_bytes() -> u64 {
+    MINER.lock().ok().and_then(|g| g.as_ref().map(|m| m.n_chunks() * 32)).unwrap_or(0)
+}
+
 /// Drop the GPU PoM miner, freeing its weight-blob VRAM so inference (priority) can use the GPU.
 /// Mining rebuilds the blob when it next runs. The host `WeightIndex` stays (cheap, disk-backed).
 pub fn uninstall() {

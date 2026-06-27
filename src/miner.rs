@@ -155,6 +155,7 @@ impl MinerManager {
                 recv,
                 manager,
                 hashes_by_worker.clone(),
+                Arc::clone(&opoi_challenge_active),
             ));
         }
         Self {
@@ -192,6 +193,7 @@ impl MinerManager {
         work_channel: watch::Receiver<Option<WorkerCommand>>,
         manager: &PluginManager,
         hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
+        opoi_challenge_active: Arc<AtomicBool>,
     ) -> Vec<MinerHandler> {
         let mut vec = Vec::<MinerHandler>::new();
         let specs = manager.build().unwrap();
@@ -204,6 +206,7 @@ impl MinerManager {
                 Arc::clone(&hashes_tried),
                 spec,
                 worker_hashes_tried,
+                Arc::clone(&opoi_challenge_active),
             ));
         }
         vec
@@ -245,6 +248,7 @@ impl MinerManager {
         hashes_tried: Arc<AtomicU64>,
         spec: Box<dyn WorkerSpec>,
         worker_hashes_tried: Arc<AtomicU64>,
+        opoi_challenge_active: Arc<AtomicBool>,
     ) -> MinerHandler {
         std::thread::spawn(move || {
             let mut box_ = spec.build();
@@ -280,6 +284,24 @@ impl MinerManager {
                     // over the resident weights instead of kHeavyHash. On a winning nonce we build
                     // the proof (host) and submit; the legacy plugin path below is skipped.
                     if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
+                        // Inference owns the GPU while a challenge runs (it has priority). Pause the
+                        // walk instead of dispatching: two Vulkan contexts sharing one compute queue
+                        // would slow inference past its OPoI deadline, and contention can stretch a
+                        // walk dispatch past the Windows TDR watchdog (~2 s) → DEVICE_LOST. When VRAM
+                        // allows, the blob stays resident across the pause (see slm::ensure_loaded) so
+                        // mining resumes with no reload; otherwise it was unloaded and the
+                        // is_installed() check below rebuilds it once the challenge clears.
+                        if opoi_challenge_active.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(100));
+                            if let Some(cmd) = block_channel.get_changed()? {
+                                state = match cmd {
+                                    Some(WorkerCommand::Job(ns)) => Some(ns),
+                                    Some(WorkerCommand::Close) => return Ok(()),
+                                    None => state,
+                                };
+                            }
+                            continue;
+                        }
                         let (pph, time, target_le) = {
                             let s = state.as_ref().unwrap();
                             let mut pph = [0u8; 32];

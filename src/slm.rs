@@ -414,8 +414,32 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     model_dir(spec).join(".ok").exists()
 }
 
+/// Whether the resident PoM weight blob can stay in VRAM while `spec`'s model is served for
+/// inference. Conservative: PoM blob + the model's inference footprint + a driver/KV margin must
+/// fit the device. Returns false when nothing is resident (uninstall is then a cheap no-op), when
+/// VRAM can't be queried, or when it simply won't fit — preserving the original
+/// free-VRAM-for-inference behaviour for the high tiers (e.g. Qwen3-32B / Llama-70B).
+fn pom_keep_resident(spec: &ModelSpec) -> bool {
+    const MB: u64 = 1024 * 1024;
+    let pom_bytes = crate::pom_gpu::resident_blob_bytes();
+    if pom_bytes == 0 {
+        return false; // nothing resident to preserve
+    }
+    let Some(total_mb) = keryx_vulkan::probe_vram_mb() else {
+        return false; // can't size the device → be safe, keep the unload
+    };
+    let pom_mb = pom_bytes / MB;
+    // Inference footprint: the model's declared min VRAM (weights + KV + workspace). For the
+    // never-gated baseline tiers (min_vram_mb == 0) fall back to the blob size — in the PoM era the
+    // served model is the mined model, so its weights ≈ the blob — plus a small KV allowance.
+    let infer_mb = if spec.min_vram_mb > 0 { spec.min_vram_mb } else { pom_mb + 2_048 };
+    // +1 GiB for the driver/framebuffer and allocator fragmentation beyond the two model footprints.
+    pom_mb + infer_mb + 1_024 <= total_mb
+}
+
 /// Ensure the llama-server is serving `model_id`, relaunching it if a different model is loaded.
-/// Inference has priority over PoW: the GPU PoM miner is uninstalled first to free its VRAM.
+/// Inference has priority over PoW. When the PoM blob and the served model fit in VRAM together it
+/// stays resident; otherwise the GPU PoM miner is uninstalled first to free its VRAM.
 /// Returns true if the server is up for this model.
 pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
     let specs = *SUPPORTED_SPECS.read().unwrap();
@@ -427,8 +451,19 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
         }
     }
 
-    // Switching model: free the PoM GPU miner's VRAM, then drop the old server.
-    crate::pom_gpu::uninstall();
+    // Switching model: free the PoM GPU miner's VRAM only if keeping it resident alongside the
+    // inference model would not fit. With headroom we keep the blob in VRAM so PoM doesn't pay a
+    // full GGUF re-read + VRAM re-stage on every challenge; the GPU worker pauses the walk during
+    // inference instead (see miner.rs), so the two never run kernels concurrently either way.
+    if pom_keep_resident(spec) {
+        log::info!(
+            "SlmEngine: keeping PoM blob resident ({} MB) alongside '{}' — enough VRAM, skipping reload",
+            crate::pom_gpu::resident_blob_bytes() / (1024 * 1024),
+            spec.name
+        );
+    } else {
+        crate::pom_gpu::uninstall();
+    }
     if let Ok(mut g) = SERVER.lock() {
         *g = None;
     }
