@@ -414,27 +414,40 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     model_dir(spec).join(".ok").exists()
 }
 
+/// Pure VRAM fit check, split out from [`pom_keep_resident`] so the arithmetic is unit-testable
+/// without a GPU. Returns whether a PoM blob of `pom_bytes` can stay resident alongside an inference
+/// model declaring `min_vram_mb` (0 = unknown → fall back to the blob size, since in the PoM era the
+/// served model *is* the mined model, plus a KV allowance) on a device with `total_mb` of VRAM. A
+/// zero-byte blob (nothing resident) never "fits" — there is nothing to preserve.
+fn pom_fits(pom_bytes: u64, min_vram_mb: u64, total_mb: u64) -> bool {
+    const MB: u64 = 1024 * 1024;
+    if pom_bytes == 0 {
+        return false;
+    }
+    let pom_mb = pom_bytes / MB;
+    let infer_mb = if min_vram_mb > 0 { min_vram_mb } else { pom_mb + 2_048 };
+    // +1 GiB for the driver/framebuffer and allocator fragmentation beyond the two model footprints.
+    pom_mb + infer_mb + 1_024 <= total_mb
+}
+
 /// Whether the resident PoM weight blob can stay in VRAM while `spec`'s model is served for
 /// inference. Conservative: PoM blob + the model's inference footprint + a driver/KV margin must
-/// fit the device. Returns false when nothing is resident (uninstall is then a cheap no-op), when
-/// VRAM can't be queried, or when it simply won't fit — preserving the original
+/// fit the device (see [`pom_fits`]). Returns false when nothing is resident (uninstall is then a
+/// cheap no-op), when VRAM can't be queried, or when it simply won't fit — preserving the original
 /// free-VRAM-for-inference behaviour for the high tiers (e.g. Qwen3-32B / Llama-70B).
+///
+/// `KERYX_POM_KEEP_RESIDENT` overrides the fit check for testing on real hardware: `1`/`true`
+/// forces the blob to stay resident, `0`/`false` forces the unload.
 fn pom_keep_resident(spec: &ModelSpec) -> bool {
-    const MB: u64 = 1024 * 1024;
-    let pom_bytes = crate::pom_gpu::resident_blob_bytes();
-    if pom_bytes == 0 {
-        return false; // nothing resident to preserve
+    match std::env::var("KERYX_POM_KEEP_RESIDENT").ok().as_deref() {
+        Some("1") | Some("true") => return true,
+        Some("0") | Some("false") => return false,
+        _ => {}
     }
     let Some(total_mb) = keryx_vulkan::probe_vram_mb() else {
         return false; // can't size the device → be safe, keep the unload
     };
-    let pom_mb = pom_bytes / MB;
-    // Inference footprint: the model's declared min VRAM (weights + KV + workspace). For the
-    // never-gated baseline tiers (min_vram_mb == 0) fall back to the blob size — in the PoM era the
-    // served model is the mined model, so its weights ≈ the blob — plus a small KV allowance.
-    let infer_mb = if spec.min_vram_mb > 0 { spec.min_vram_mb } else { pom_mb + 2_048 };
-    // +1 GiB for the driver/framebuffer and allocator fragmentation beyond the two model footprints.
-    pom_mb + infer_mb + 1_024 <= total_mb
+    pom_fits(crate::pom_gpu::resident_blob_bytes(), spec.min_vram_mb, total_mb)
 }
 
 /// Ensure the llama-server is serving `model_id`, relaunching it if a different model is loaded.
@@ -512,5 +525,49 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             log::warn!("SlmEngine '{}' inference error: {}", spec.name, e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pom_fits;
+
+    const MB: u64 = 1024 * 1024;
+    // ~20 GB DEVICE_LOCAL heap a 7900 XT reports (see Vk::device_local_vram_mb doc).
+    const VRAM_7900XT: u64 = 20_464;
+
+    #[test]
+    fn nothing_resident_never_fits() {
+        // No blob in VRAM → nothing to keep, regardless of device size.
+        assert!(!pom_fits(0, 8_000, VRAM_7900XT));
+        assert!(!pom_fits(0, 0, 1_000_000));
+    }
+
+    #[test]
+    fn default_tier_dolphin_fits_on_7900xt() {
+        // Dolphin-8B: ~4.9 GB blob + min_vram_mb 8000 + 1 GiB margin ≈ 13.9 GB ≤ 20 GB.
+        assert!(pom_fits(4_900 * MB, 8_000, VRAM_7900XT));
+    }
+
+    #[test]
+    fn high_tier_qwen3_does_not_fit_on_7900xt() {
+        // Qwen3-32B: ~19.5 GB blob + min_vram_mb 24000 → far over 20 GB → unload (original behaviour).
+        assert!(!pom_fits(19_500 * MB, 24_000, VRAM_7900XT));
+    }
+
+    #[test]
+    fn baseline_tier_zero_min_vram_uses_blob_fallback() {
+        // Gemma-3-4B: min_vram_mb 0 → fall back to blob (~3 GB) + 2 GiB KV + 1 GiB margin ≈ 9 GB.
+        assert!(pom_fits(3_000 * MB, 0, VRAM_7900XT));
+        // ...but the same fallback must still fail on a small card.
+        assert!(!pom_fits(3_000 * MB, 0, 8_000));
+    }
+
+    #[test]
+    fn boundary_is_inclusive() {
+        // pom_mb + min + margin == total → fits (<=); one MB less → does not.
+        // 4000 + 5000 + 1024 = 10024.
+        assert!(pom_fits(4_000 * MB, 5_000, 10_024));
+        assert!(!pom_fits(4_000 * MB, 5_000, 10_023));
     }
 }
