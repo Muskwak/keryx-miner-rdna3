@@ -12,7 +12,7 @@ runs:
       shell: bash
       run: |
         set -euxo pipefail
-        ver=1.3.296.0   # bump as needed; LunarG keeps older SDKs downloadable
+        ver=1.4.350.0   # bump as needed; LunarG keeps older SDKs downloadable
         wget -qO /tmp/vulkansdk.tar.xz "https://sdk.lunarg.com/sdk/download/${ver}/linux/vulkansdk-linux-x86_64-${ver}.tar.xz"
         mkdir -p "$HOME/vulkan-sdk"
         tar -xf /tmp/vulkansdk.tar.xz -C "$HOME/vulkan-sdk"
@@ -26,8 +26,8 @@ runs:
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        $ver = "1.3.296.0"   # bump as needed; LunarG keeps older installers downloadable
-        Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe" -OutFile "$env:RUNNER_TEMP\vulkan.exe"
+        $ver = "1.4.350.0"   # bump as needed; LunarG keeps older installers downloadable
+        Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe" -OutFile "$env:RUNNER_TEMP\vulkan.exe"
         Start-Process -FilePath "$env:RUNNER_TEMP\vulkan.exe" -ArgumentList '--accept-licenses','--default-answer','--confirm-command','install' -Wait
         "VULKAN_SDK=C:\VulkanSDK\$ver"            | Out-File -FilePath $env:GITHUB_ENV -Append
         "GLSLC=C:\VulkanSDK\$ver\Bin\glslc.exe"   | Out-File -FilePath $env:GITHUB_ENV -Append
