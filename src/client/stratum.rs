@@ -83,7 +83,12 @@ pub struct ShareStats {
     pub duplicate: AtomicU64,
     pub invalid_opoi: AtomicU64,
     pub invalid_pom: AtomicU64,
-    pub shares_pending: Mutex<HashMap<u32, String>>,
+    // std::sync::Mutex (NOT tokio): every critical section is a tiny synchronous map op
+    // (insert/remove/len) that is never held across an `.await`, and `Display::fmt` (a sync
+    // context) also needs it. The old tokio `try_lock().unwrap()` panicked the moment two tasks
+    // touched the map at once (submit insert vs. accept/reject remove vs. periodic len), which
+    // killed the submit task and produced an endless "channel closed" flood.
+    pub shares_pending: std::sync::Mutex<HashMap<u32, String>>,
 }
 
 static SHARE_STATS: OnceLock<Arc<ShareStats>> = OnceLock::new();
@@ -124,7 +129,7 @@ impl Display for ShareStats {
                 0 => "".to_string(),
                 v => format!("Invalid PoM proof: {} ", v),
             },
-            self.shares_pending.try_lock().unwrap().len()
+            self.shares_pending.lock().unwrap().len()
         )
     }
 }
@@ -360,7 +365,7 @@ impl StratumHandler {
                     BlockSeed::FullBlock(_) => unreachable!(),
                 };
                 let msg_id = last_stratum_id.fetch_add(1, Ordering::SeqCst);
-                share_stats.shares_pending.try_lock().unwrap().insert(msg_id, job_id.clone());
+                share_stats.shares_pending.lock().unwrap().insert(msg_id, job_id.clone());
                 let nonce_hex = format!("{:016x}", nonce);
                 let opoi_tag = keryx_inference::tag_fixed(nonce);
 
@@ -447,13 +452,13 @@ impl StratumHandler {
                     StratumLinePayload::StratumResult { result } if id.is_some() => {
                         match result {
                             StratumResult::Plain(Some(true)) | StratumResult::Eth((true, _)) => {
-                                if let Some(_jobid) = self
+                                let removed = self
                                     .shares_stats
                                     .shares_pending
-                                    .try_lock()
+                                    .lock()
                                     .unwrap()
-                                    .remove(&id.expect("We checked id is not none"))
-                                {
+                                    .remove(&id.expect("We checked id is not none"));
+                                if removed.is_some() {
                                     self.shares_stats.accepted.fetch_add(1, Ordering::SeqCst);
                                     info!("Share accepted");
                                 } else {
@@ -611,7 +616,9 @@ impl StratumHandler {
                 error: Some(StratumError(code, error, _)),
                 ..
             } => {
-                let jobid = { self.shares_stats.shares_pending.try_lock().unwrap().remove(&id) }.unwrap();
+                // Option, not unwrap(): a pool error for an id we never tracked (or already
+                // removed) must not panic — jobid is only used for the warn! below.
+                let jobid = self.shares_stats.shares_pending.lock().unwrap().remove(&id);
                 match code {
                     ErrorCode::Unknown => {
                         // Match solo-mining behaviour (grpc.rs SubmitBlockResponse): a rejected
