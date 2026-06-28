@@ -1,0 +1,98 @@
+Initializing daemon...
+Kubo version: 0.42.0-969853d96
+Repo version: 18
+System version: amd64/windows
+Golang version: go1.26.4
+PeerID: 12D3KooWBj5Ha8Ph4EjmRCMfdpJ69TQQh2GNmh7ympBB6i6iCUmD
+Swarm listening on 127.0.0.1:4001 (TCP+UDP)
+Swarm listening on 169.254.68.124:4001 (TCP+UDP)
+Swarm listening on 172.20.208.1:4001 (TCP+UDP)
+Swarm listening on 172.30.176.1:4001 (TCP+UDP)
+Swarm listening on 192.168.1.38:4001 (TCP+UDP)
+Swarm listening on [::1]:4001 (TCP+UDP)
+Run 'ipfs id' to inspect announced and discovered multiaddrs of this node.
+RPC API server listening on /ip4/127.0.0.1/tcp/5001
+WebUI: http://127.0.0.1:5001/webui
+Gateway server listening on /ip4/127.0.0.1/tcp/8080
+Routing V1 API exposed at http://127.0.0.1:8080/routing/v1
+Daemon is ready
+
+Received interrupt signal, shutting down...
+(Hit ctrl-c again to force-shutdown the daemon.)
+Initializing daemon...
+Kubo version: 0.42.0-969853d96
+Repo version: 18
+System version: amd64/windows
+Golang version: go1.26.4
+PeerID: 12D3KooWBj5Ha8Ph4EjmRCMfdpJ69TQQh2GNmh7ympBB6i6iCUmD
+Swarm listening on 127.0.0.1:4001 (TCP+UDP)
+Swarm listening on 169.254.68.124:4001 (TCP+UDP)
+Swarm listening on 172.20.208.1:4001 (TCP+UDP)
+Swarm listening on 172.30.176.1:4001 (TCP+UDP)
+Swarm listening on 192.168.1.38:4001 (TCP+UDP)
+Swarm listening on [::1]:4001 (TCP+UDP)
+Run 'ipfs id' to inspect announced and discovered multiaddrs of this node.
+RPC API server listening on /ip4/127.0.0.1/tcp/5001
+WebUI: http://127.0.0.1:5001/webui
+Gateway server listening on /ip4/127.0.0.1/tcp/8080
+Routing V1 API exposed at http://127.0.0.1:8080/routing/v1
+Daemon is ready
+
+Received interrupt signal, shutting down...
+(Hit ctrl-c again to force-shutdown the daemon.)
+Initializing daemon...
+Kubo version: 0.42.0-969853d96
+Repo version: 18
+System version: amd64/windows
+Golang version: go1.26.4
+PeerID: 12D3KooWBj5Ha8Ph4EjmRCMfdpJ69TQQh2GNmh7ympBB6i6iCUmD
+Swarm listening on 127.0.0.1:4001 (TCP+UDP)
+Swarm listening on 169.254.68.124:4001 (TCP+UDP)
+Swarm listening on 172.20.208.1:4001 (TCP+UDP)
+Swarm listening on 172.30.176.1:4001 (TCP+UDP)
+Swarm listening on 192.168.1.38:4001 (TCP+UDP)
+Swarm listening on [::1]:4001 (TCP+UDP)
+Run 'ipfs id' to inspect announced and discovered multiaddrs of this node.
+RPC API server listening on /ip4/127.0.0.1/tcp/5001
+WebUI: http://127.0.0.1:5001/webui
+Gateway server listening on /ip4/127.0.0.1/tcp/8080
+Routing V1 API exposed at http://127.0.0.1:8080/routing/v1
+Daemon is ready
+
+Received interrupt signal, shutting down...
+(Hit ctrl-c again to force-shutdown the daemon.)
+Initializing daemon...
+Kubo version: 0.42.0-969853d96
+Repo version: 18
+System version: amd64/windows
+Golang version: go1.26.4
+PeerID: 12D3KooWBj5Ha8Ph4EjmRCMfdpJ69TQQh2GNmh7ympBB6i6iCUmD
+Swarm listening on 127.0.0.1:4001 (TCP+UDP)
+Swarm listening on 169.254.68.124:4001 (TCP+UDP)
+Swarm listening on 172.20.208.1:4001 (TCP+UDP)
+Swarm listening on 172.30.176.1:4001 (TCP+UDP)
+Swarm listening on 192.168.1.38:4001 (TCP+UDP)
+Swarm listening on [::1]:4001 (TCP+UDP)
+Run 'ipfs id' to inspect announced and discovered multiaddrs of this node.
+RPC API server listening on /ip4/127.0.0.1/tcp/5001
+WebUI: http://127.0.0.1:5001/webui
+Gateway server listening on /ip4/127.0.0.1/tcp/8080
+Routing V1 API exposed at http://127.0.0.1:8080/routing/v1
+Daemon is ready
+Initializing daemon...
+Kubo version: 0.42.0-969853d96
+Repo version: 18
+System version: amd64/windows
+Golang version: go1.26.4
+PeerID: 12D3KooWBj5Ha8Ph4EjmRCMfdpJ69TQQh2GNmh7ympBB6i6iCUmD
+Swarm listening on 127.0.0.1:4001 (TCP+UDP)
+Swarm listening on 169.254.68.124:4001 (TCP+UDP)
+Swarm listening on 172.19.0.1:4001 (TCP+UDP)
+Swarm listening on 192.168.1.38:4001 (TCP+UDP)
+Swarm listening on [::1]:4001 (TCP+UDP)
+Run 'ipfs id' to inspect announced and discovered multiaddrs of this node.
+RPC API server listening on /ip4/127.0.0.1/tcp/5001
+WebUI: http://127.0.0.1:5001/webui
+Gateway server listening on /ip4/127.0.0.1/tcp/8080
+Routing V1 API exposed at http://127.0.0.1:8080/routing/v1
+Daemon is ready
