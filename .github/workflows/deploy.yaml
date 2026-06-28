@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 # RDNA3 / Vulkan fork: single self-contained binary (no CUDA/OpenCL plugin .so/.dll). Linux + Windows
-# only — the fork targets AMD RDNA3 via Vulkan. Build needs `protoc` + the Vulkan SDK's `glslc`.
+# only — the fork targets AMD RDNA3 via Vulkan. Build needs `protoc` + a recent `glslc`.
 
 jobs:
   build:
@@ -30,27 +30,8 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Vulkan SDK (glslc) — Linux
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y glslc || {
-            wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
-            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-$(lsb_release -cs).list https://packages.lunarg.com/vulkan/lunarg-vulkan-$(lsb_release -cs).list
-            sudo apt-get update
-            sudo apt-get install -y vulkan-sdk
-          }
-          glslc --version
-
-      - name: Install Vulkan SDK (glslc) — Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ver = "1.3.296.0"  # bump as needed; LunarG keeps older installers available
-          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe" -OutFile "$env:RUNNER_TEMP\vulkan.exe"
-          Start-Process -FilePath "$env:RUNNER_TEMP\vulkan.exe" -ArgumentList '--accept-licenses','--default-answer','--confirm-command','install' -Wait
-          "VULKAN_SDK=C:\VulkanSDK\$ver" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "C:\VulkanSDK\$ver\Bin"        | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Install Vulkan SDK (glslc)
+        uses: ./.github/actions/vulkan-sdk
 
       - uses: dtolnay/rust-toolchain@stable
 
