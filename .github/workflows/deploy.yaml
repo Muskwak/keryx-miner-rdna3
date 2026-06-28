@@ -26,7 +26,7 @@ jobs:
         run: git config --global core.autocrlf false
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: rustfs/setup-protoc@v3.0.1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -47,6 +47,25 @@ jobs:
           tar czvf "$asset.tgz" "$asset"
           echo "ASSET=$asset.tgz" >> "$GITHUB_ENV"
 
+      # HiveOS custom-miner package: the *-hiveos.tgz a flightsheet's "Installation URL"
+      # points at. Extracts to /hive/miners/custom/keryx-miner/ on the rig. Linux only.
+      - name: Package HiveOS flightsheet (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          pkg="keryx-miner"
+          # Regenerate the manifest so CUSTOM_VERSION tracks the release tag.
+          ( cd integrations/hiveos && bash createmanifest.sh "${tag#v}" keryx-miner )
+          mkdir -p "$pkg"
+          cp integrations/hiveos/h-config.sh \
+             integrations/hiveos/h-run.sh \
+             integrations/hiveos/h-stats.sh \
+             integrations/hiveos/h-manifest.conf "$pkg/"
+          cp target/release/keryx-miner "$pkg/keryx-miner"
+          strip "$pkg/keryx-miner" || true
+          chmod +x "$pkg"/*.sh "$pkg/keryx-miner"
+          tar czvf "keryx-miner-${tag}-hiveos.tgz" "$pkg"
+
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -63,4 +82,9 @@ jobs:
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET }}
+          # env.ASSET is the per-OS binary (literal path, always present). The hiveos
+          # line is a glob: it matches on the Linux runner and is harmlessly skipped on
+          # Windows where no such file was produced.
+          files: |
+            ${{ env.ASSET }}
+            keryx-miner-*-hiveos.tgz
