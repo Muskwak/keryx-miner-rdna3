@@ -131,22 +131,23 @@ impl<T: Clone> Receiver<T> {
     }
 
     pub fn wait_for_change(&mut self) -> Result<T, ChannelClosed> {
+        // Fast path: a change is already available (or the sender is gone).
         if let Some(v) = Self::get_changed_internal(&mut self.last_observed, &self.shared)? {
             return Ok(v);
         }
-        let lock = self.shared.wait_for_change.lock();
-        // Check if while acquiring the lock something changed.
-        if let Some(v) = Self::get_changed_internal(&mut self.last_observed, &self.shared)? {
-            return Ok(v);
+        let mut lock = self.shared.wait_for_change.lock();
+        loop {
+            // Re-check under the lock: a value may have been published, or the sender
+            // dropped, between the check above and acquiring the lock. Holding the lock here
+            // also prevents a lost wakeup, since `wake_up_threads` must take the same lock.
+            if let Some(v) = Self::get_changed_internal(&mut self.last_observed, &self.shared)? {
+                return Ok(v);
+            }
+            // Wait for a notification of a new value or the sender dropping. The wait may
+            // return spuriously (notably on Windows), so we loop and re-check the condition
+            // rather than assuming a change occurred.
+            lock = self.shared.notify_change.wait(lock);
         }
-        // wait for a notification of a new value
-        let _lock = self.shared.notify_change.wait(lock);
-        // Recheck if the sender is alive as it might've changed while waiting
-        if !self.shared.sender_alive() {
-            return Err(ChannelClosed(()));
-        }
-        self.last_observed = self.shared.id();
-        Ok(self.shared.clone_value())
     }
 }
 
