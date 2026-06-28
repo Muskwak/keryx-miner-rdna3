@@ -12,7 +12,12 @@ set "MINING_ADDRESS=keryx:qz4zajm2kecfy5c6qctepdnt4666yz0qhff5alnhyy6jjzfm94svxy
 
 REM --- Pool and worker name (these are also the built-in defaults) ---
 REM set "POOL=stratum+tcp://krx.suprnova.cc:4404"
-set "POOL=stratum+tcp://krx.baikalmine.com:9020"
+set "POOL=stratum+tcp://krx.suprnova.cc:4401"
+REM set "POOL=stratum+tcp://krx.baikalmine.com:9020"
+REM set "POOL=stratum+tcp://eu.miningcrib.com:7212"
+REM set "POOL=stratum+tcp://pool.ddsolutions.ai:5555"
+REM set "POOL=stratum+tcp://sg.keryx.dongqn.com:5555"
+
 set "WORKER=rx7900xt"
 
 REM --- GPU PoW batch size (nonces per dispatch). 4194304 (4M) is tuned for the
@@ -23,7 +28,11 @@ REM --- PoW-only: mine kHeavyHash shares on the pool WITHOUT OPoI models or
 REM     llama-server. Comment out the next line (REM in front) to run the full
 REM     miner instead (downloads the OPoI model GGUFs and launches llama-server;
 REM     requires target\release\llama\llama-server.exe to be present). ---
-set "KERYX_POW_ONLY=1"
+set "KERYX_POW_ONLY=0"
+set "KERYX_SKIP_LEGACY_MODELS=1"
+
+set RUST_LOG=debug
+set RUST_BACKTRACE=1
 
 REM ----------------------------------------------------------------------------
 cd /d "%~dp0"
