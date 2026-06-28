@@ -85,6 +85,13 @@ pub struct Opt {
     #[clap(long = "worker", default_value = "rx7900xt", help = "Pool worker name (sent as address.worker in the stratum login)")]
     pub worker: String,
 
+    #[clap(
+        long = "password",
+        default_value = "x",
+        help = "Stratum password sent at mining.authorize. On suprnova-style pools this requests a fixed difficulty (e.g. d=1000); 'x' = pool default/vardiff"
+    )]
+    pub password: String,
+
     #[clap(long = "devfund-percent", help = "The percentage of blocks to send to the devfund (minimum 2%)", default_value = "2", parse(try_from_str = parse_devfund_percent))]
     pub devfund_percent: u16,
 

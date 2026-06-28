@@ -139,6 +139,8 @@ pub struct StratumHandler {
     miner_address: String,
     /// Pool worker name (appended to the authorize username as `address.worker`); empty = none.
     worker: String,
+    /// Stratum password sent at mining.authorize (pool difficulty request, e.g. `d=1000`); `x` = default.
+    password: String,
     mine_when_not_synced: bool,
     devfund_address: Option<String>,
     devfund_percent: u16,
@@ -214,7 +216,7 @@ impl Client for StratumHandler {
                     // Pool username: `address.worker` (so the pool tags shares per rig), or just
                     // the address when no worker name is set.
                     if self.worker.is_empty() { pay_address.clone() } else { format!("{}.{}", pay_address, self.worker) },
-                    "x".into(),
+                    self.password.clone(),
                 ))),
                 jsonrpc: None,
                 error: None,
@@ -278,6 +280,7 @@ impl StratumHandler {
         address: String,
         miner_address: String,
         worker: String,
+        password: String,
         mine_when_not_synced: bool,
         block_template_ctr: Option<Arc<AtomicU16>>,
         ipfs_url: String,
@@ -316,6 +319,7 @@ impl StratumHandler {
             send_channel,
             miner_address,
             worker,
+            password,
             mine_when_not_synced,
             devfund_address: None,
             devfund_percent: 0,
