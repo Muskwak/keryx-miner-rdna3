@@ -87,16 +87,12 @@ fn ensure_installed_inner() -> bool {
             Some(t) => t,
             None => return false,
         };
-        info!("PoM(vulkan): building possession index (first activation) — this can take a while…");
-        match crate::pom::WeightIndex::build_from_gguf(gguf) {
-            Ok(idx) => {
-                info!("PoM(vulkan): weight index ready — N={} chunks", idx.n_chunks);
-                crate::pom::set_index(idx, tier);
-            }
-            Err(e) => {
-                log::error!("PoM(vulkan): index build failed: {}", e);
-                return false;
-            }
+        // Serialize the one-time host index build across PoM workers. Harmless for a single worker,
+        // but required once >1 worker exists: build_from_gguf writes a per-process Merkle tree, so
+        // concurrent builds would clobber the same file. get_or_build_index makes exactly one build.
+        let gguf_path = gguf.clone();
+        if !crate::pom::get_or_build_index(tier, || crate::pom::WeightIndex::build_from_gguf(&gguf_path)) {
+            return false;
         }
     }
 

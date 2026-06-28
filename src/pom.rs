@@ -37,7 +37,7 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
         return Ok(());
     }
 }
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 pub const CHUNK_WORDS: usize = 4; // 32 B chunk
 const SEED_SALT: u64 = 0x4B65727978500; // "KeryxP"
@@ -592,6 +592,46 @@ pub fn active_index() -> Option<&'static (WeightIndex, u8)> {
     POM_INDEX.get()
 }
 
+/// Guards the one-time possession-index build. Every PoM GPU worker races into activation at the
+/// same DAA, but `WeightIndex::build_from_gguf` writes a per-*process* Merkle tree (`pom-tree-<pid>
+/// .bin`), so two threads building concurrently clobber the same file — the
+/// "failed to fill whole buffer" startup failure seen on multi-GPU rigs. This is harmless on a
+/// single worker; it only bites once >1 PoM worker exists.
+static INDEX_BUILD_LOCK: Mutex<()> = Mutex::new(());
+
+/// Build + install the possession index exactly once across racing workers. Returns true when the
+/// index is ready (already installed, or built here). `build` runs only on the single thread that
+/// wins the lock with the index still absent; the others wait, then observe it installed.
+///
+/// Double-checked: the cheap `active_index()` read short-circuits the common case (index already
+/// built) without taking the lock; the second check under the lock closes the race window.
+pub fn get_or_build_index<F>(tier: u8, build: F) -> bool
+where
+    F: FnOnce() -> candle_core::Result<WeightIndex>,
+{
+    if active_index().is_some() {
+        return true;
+    }
+    // A poisoned lock just means a prior builder panicked; the guard's data is `()`, so recover it
+    // and proceed — the double-check below still keeps the build single.
+    let _guard = INDEX_BUILD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    if active_index().is_some() {
+        return true;
+    }
+    log::info!("PoM: building possession index (first PoM activation) — this can take a while…");
+    match build() {
+        Ok(idx) => {
+            log::info!("PoM: weight index ready — N={} chunks", idx.n_chunks);
+            set_index(idx, tier);
+            true
+        }
+        Err(e) => {
+            log::error!("PoM: index build failed: {e}");
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +662,38 @@ mod tests {
             data.extend_from_slice(&b);
         }
         finalize_disk_tree(writer, tree_path, n, ChunkSource::Ram(data)).unwrap()
+    }
+
+    /// The possession index must be built exactly once even when many PoM GPU workers race into
+    /// activation at the same DAA — the multi-GPU "failed to fill whole buffer" bug. Pure host/disk
+    /// (no GPU), so it runs in CI. NOTE: this is the only test that installs the process-global
+    /// `POM_INDEX`; no other test asserts `active_index()` is None.
+    #[test]
+    fn index_built_exactly_once_under_worker_race() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        use std::sync::{Arc, Barrier};
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let k = 8usize;
+        let gate = Arc::new(Barrier::new(k));
+        let handles: Vec<_> = (0..k)
+            .map(|_| {
+                let builds = Arc::clone(&builds);
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait(); // release all threads at once to maximize the race
+                    get_or_build_index(0, || {
+                        builds.fetch_add(1, O::SeqCst);
+                        Ok(synth_index(64))
+                    })
+                })
+            })
+            .collect();
+
+        let all_ready = handles.into_iter().all(|h| h.join().unwrap());
+        assert!(all_ready, "every racing worker must observe a ready index");
+        assert_eq!(builds.load(O::SeqCst), 1, "index must be built exactly once despite the race");
+        assert!(active_index().is_some(), "index must be installed after the race");
     }
 
     /// GGUF-backed `read_chunk`: lay the canonical chunks across 3 "tensors" with header + inter-
