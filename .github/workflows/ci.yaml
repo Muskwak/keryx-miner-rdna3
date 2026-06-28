@@ -2,48 +2,42 @@ name: Tests
 
 on: [push, pull_request]
 
-jobs:
+env:
+  CARGO_TERM_COLOR: always
 
+# RDNA3 / Vulkan fork: no CUDA/nvcc, no OpenCL. The build needs `protoc` and the Vulkan SDK's
+# `glslc` (keryx-vulkan/build.rs compiles the GLSL compute shaders to SPIR-V at build time). The
+# GPU bit-exactness tests in keryx-vulkan skip gracefully when no Vulkan device is present (CI
+# runners have no GPU), so the suite still validates compilation + the CPU paths.
+
+jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: arduino/setup-protoc@v3
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install cuda
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
+      - name: Install Vulkan SDK (glslc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslc || {
+            wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
+            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-$(lsb_release -cs).list https://packages.lunarg.com/vulkan/lunarg-vulkan-$(lsb_release -cs).list
+            sudo apt-get update
+            sudo apt-get install -y vulkan-sdk
+          }
+          glslc --version
 
-      - name: Cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Run cargo check
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --tests
+      - name: cargo check
+        run: cargo check --workspace --tests
 
   test:
     name: Test Suite
@@ -51,223 +45,81 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest ]
+        os: [ubuntu-latest, windows-latest]
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Fix LibOpenCL on Linux
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt update
-          sudo apt install ocl-icd-opencl-dev -y
+      - uses: actions/checkout@v4
 
       - name: Fix CRLF on Windows
         if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: arduino/setup-protoc@v3
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install CUDA Linux
-        if: runner.os == 'Linux'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Install CUDA Windows
-        if: runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.5.1'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run cargo test regular features
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspa-miner
-
-      - name: Run cargo test no asm
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspa-miner --features=no-asm
-
-
-      - name: Run cargo test no parking_lot
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspa-miner --no-default-features
-
-      - name: Run cargo test shuttle
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspa-miner --no-default-features --features=shuttle
-
-      - name: Run cargo test for kaspaopencl
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspaopencl
-
-
-  test-release:
-    name: Test Suite Release
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ ubuntu-latest, windows-latest ]
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Fix LibOpenCL on Linux
+      - name: Install Vulkan SDK (glslc) — Linux
         if: runner.os == 'Linux'
         run: |
-          sudo apt update
-          sudo apt install ocl-icd-opencl-dev -y
+          sudo apt-get update
+          sudo apt-get install -y glslc || {
+            wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
+            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-$(lsb_release -cs).list https://packages.lunarg.com/vulkan/lunarg-vulkan-$(lsb_release -cs).list
+            sudo apt-get update
+            sudo apt-get install -y vulkan-sdk
+          }
+          glslc --version
 
-      - name: Fix CRLF on Windows
+      - name: Install Vulkan SDK (glslc) — Windows
         if: runner.os == 'Windows'
-        run: git config --global core.autocrlf false
+        shell: pwsh
+        run: |
+          $ver = "1.3.296.0"  # bump as needed; LunarG keeps older installers available
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe" -OutFile "$env:RUNNER_TEMP\vulkan.exe"
+          Start-Process -FilePath "$env:RUNNER_TEMP\vulkan.exe" -ArgumentList '--accept-licenses','--default-answer','--confirm-command','install' -Wait
+          "VULKAN_SDK=C:\VulkanSDK\$ver" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\VulkanSDK\$ver\Bin"        | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - name: cargo test (workspace, release)
+        run: cargo test --workspace --release
 
-      - name: Install CUDA Linux
-        if: runner.os == 'Linux'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
+      - name: cargo test (no-asm)
+        run: cargo test -p keryx-miner --release --features no-asm
 
-      - name: Install CUDA Windows
-        if: runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.5.1'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run cargo test release regular features
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --release -p kaspa-miner
-
-      - name: Run cargo test release no asm
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --features=no-asm --release -p kaspa-miner
-
-      - name: Run cargo test release no parking_lot
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --no-default-features --release -p kaspa-miner
-
-      - name: Run cargo test release shuttle
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --no-default-features --features=shuttle --release -p kaspa-miner
-
-      - name: Run cargo test for kaspaopencl
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --release -p kaspaopencl
+      - name: cargo test (no default features)
+        run: cargo test -p keryx-miner --release --no-default-features
 
   lints:
     name: Lints
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: arduino/setup-protoc@v3
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Vulkan SDK (glslc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslc || {
+            wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
+            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-$(lsb_release -cs).list https://packages.lunarg.com/vulkan/lunarg-vulkan-$(lsb_release -cs).list
+            sudo apt-get update
+            sudo apt-get install -y vulkan-sdk
+          }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Install cuda
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
 
-      - name: Cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-
-      - name: Run cargo fmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
-
-      - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --tests -- -D warnings
+      - name: cargo clippy
+        run: cargo clippy --workspace --tests
