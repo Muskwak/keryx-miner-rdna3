@@ -88,6 +88,13 @@ pub struct ShareStats {
 
 static SHARE_STATS: OnceLock<Arc<ShareStats>> = OnceLock::new();
 
+/// Last real DAA score from a job that carries one (WithTask / ShortV2). The plain `Short` notify
+/// carries NO daa_score; pinning it to the SALT-v4 era (21,932,751) leaves it BELOW PoM activation
+/// (37,780,000), so a Short-only pool never crosses `daa >= POM_ACTIVATION_DAA` — the miner keeps
+/// hashing kHeavyHash post-fork and submits an empty/invalid PoM proof the pool rejects. Remembering
+/// the last real daa lets `Short` inherit it so PoM activates. (Ported from keryx-miner-supr v0.6.3.)
+static LAST_DAA_SCORE: AtomicU64 = AtomicU64::new(0);
+
 impl Display for ShareStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -173,7 +180,13 @@ impl Client for StratumHandler {
                 id,
                 payload: StratumLinePayload::StratumCommand(StratumCommand::Subscribe(
                     MiningSubscribe::MiningSubscribeOptions((
-                        format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+                        // suprnova's bridge version-gates PoM shares: it rejects miners reporting
+                        // below keryx-miner-supr/0.6.3 ("v0.6.1/v0.6.2 do NOT generate valid PoM
+                        // proofs — upgrade to 0.6.3+") even when the proof is valid. We ported
+                        // 0.6.3's Short-notify daa fix above and have had shares accepted, so we are
+                        // 0.6.3-equivalent — advertise the identity the pool requires so the gate
+                        // passes. (Real build: keryx-miner/CARGO_PKG_VERSION.)
+                        "keryx-miner-supr/0.6.3".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),
@@ -475,6 +488,8 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
+                            // Remember the real daa so plain `Short` notifies can inherit it (PoM gate).
+                            LAST_DAA_SCORE.store(daa_score, Ordering::Relaxed);
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             if !keryx_miner::pow_only() && keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
@@ -518,6 +533,8 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
+                            // Remember the real daa so plain `Short` notifies can inherit it (PoM gate).
+                            LAST_DAA_SCORE.store(daa_score, Ordering::Relaxed);
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             if !keryx_miner::pow_only() && keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
@@ -559,10 +576,13 @@ impl StratumHandler {
                                     id,
                                     header_hash,
                                     timestamp,
-                                    // Short stratum notify carries no daa_score; pin it to the
-                                    // current salt era so the host generates the right matrix.
-                                    // Post-relaunch the chain is on SALT v4, so force v4.
-                                    daa_score: crate::pow::heavy_hash::POW_SALT_V4_ACTIVATION_DAA,
+                                    // Short stratum notify carries no daa_score. Inherit the last
+                                    // real daa (from WithTask/ShortV2) so post-fork PoM still
+                                    // activates on Short-only pools; floor at the SALT-v4 era so the
+                                    // host still builds the right kHeavyHash matrix before the fork.
+                                    daa_score: LAST_DAA_SCORE
+                                        .load(Ordering::Relaxed)
+                                        .max(crate::pow::heavy_hash::POW_SALT_V4_ACTIVATION_DAA),
                                     nonce: 0,
                                     target: self.target_pool,
                                     nonce_mask: self.nonce_mask,
