@@ -101,12 +101,12 @@ PoW workers if you want them.
 ./keryx-miner --mining-address keryx:YOUR_ADDRESS \
   --keryxd-address stratum+tcp://krx.suprnova.cc:4401 \
   --worker rig1 \
-  --password d=1000
+  --password d=1
 ```
 
 - `--worker` is sent as `address.worker` so the pool credits shares per rig.
 - `--password` is the stratum `mining.authorize` password; on suprnova-style pools it requests a
-  fixed difficulty (e.g. `d=1000`). Default `x` = the pool's own (vardiff) difficulty.
+  fixed difficulty (e.g. `d=1`). Default `x` = the pool's own (vardiff) difficulty.
 
 ### All options
 
