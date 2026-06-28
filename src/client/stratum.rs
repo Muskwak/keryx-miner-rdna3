@@ -260,10 +260,17 @@ impl Client for StratumHandler {
         info!("Waiting for stuff");
         loop {
             {
-                if (!self.mining_dev.unwrap_or(true)
-                    && self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent)
-                    || (self.mining_dev.unwrap_or(false)
-                        && self.block_template_ctr.load(Ordering::SeqCst) > self.devfund_percent)
+                // Devfund payout rotation: the pool authorizes one payout address per session, so
+                // switching between the miner's address and the devfund address requires a reconnect.
+                // Drop the session (the supervisor reconnects + re-runs register()) when the currently
+                // authorized address no longer matches what block_template_ctr now says it should be.
+                // Only relevant when a devfund is configured — without one, devfund_percent == 0 and
+                // this would spuriously fire every time the (randomly-seeded, wrapping) counter hits 0.
+                if self.devfund_address.is_some()
+                    && ((!self.mining_dev.unwrap_or(true)
+                        && self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent)
+                        || (self.mining_dev.unwrap_or(false)
+                            && self.block_template_ctr.load(Ordering::SeqCst) > self.devfund_percent))
                 {
                     return Ok(());
                 }
