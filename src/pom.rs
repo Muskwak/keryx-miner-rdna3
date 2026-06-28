@@ -440,7 +440,20 @@ impl WeightIndex {
         // Tree temp file next to the GGUF (disk-backed; /tmp may be tmpfs = RAM).
         let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
         let tree_path = dir.join(format!("pom-tree-{}.bin", std::process::id()));
-        let _ = std::fs::remove_file(&tree_path); // clear a stale file from a crashed run
+        // Sweep ALL stale `pom-tree-*.bin` from prior runs, not just this PID's. The `Drop` cleanup
+        // is skipped whenever the miner ends via `process::exit` (the 3-strikes supervised restart)
+        // or a panic, so each restart would otherwise orphan a fresh ~9 GB (8B) … ~84 GB (70B) tree
+        // and fill the disk. One miner per GPU ⇒ any existing tree is a dead run's orphan, safe to
+        // remove; this bounds on-disk trees to the single one we build next.
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let fname = fname.to_string_lossy();
+                if fname.starts_with("pom-tree-") && fname.ends_with(".bin") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         let mut writer = BufWriter::new(
             OpenOptions::new().read(true).write(true).create(true).truncate(true)
                 .open(&tree_path).map_err(candle_core::Error::wrap)?,
