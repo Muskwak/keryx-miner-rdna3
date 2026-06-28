@@ -1,0 +1,35 @@
+name: Install Vulkan SDK (glslc)
+description: >
+  Install a recent glslc (shaderc, from the LunarG Vulkan SDK) for compiling the keryx-vulkan
+  GLSL compute shaders to SPIR-V. A current glslc is required — distro packages are too old to
+  know GL_EXT_integer_dot_product (RDNA3's hardware packed dot product used by the kHeavyHash kernel).
+
+runs:
+  using: composite
+  steps:
+    - name: Install Vulkan SDK — Linux
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euxo pipefail
+        ver=1.3.296.0   # bump as needed; LunarG keeps older SDKs downloadable
+        wget -qO /tmp/vulkansdk.tar.xz "https://sdk.lunarg.com/sdk/download/${ver}/linux/vulkansdk-linux-x86_64-${ver}.tar.xz"
+        mkdir -p "$HOME/vulkan-sdk"
+        tar -xf /tmp/vulkansdk.tar.xz -C "$HOME/vulkan-sdk"
+        # Locate glslc regardless of the tarball's internal layout; build.rs honours $GLSLC first.
+        glslc_bin="$(find "$HOME/vulkan-sdk" -type f -name glslc | head -n1)"
+        test -n "$glslc_bin"
+        echo "GLSLC=$glslc_bin" >> "$GITHUB_ENV"
+        "$glslc_bin" --version
+
+    - name: Install Vulkan SDK — Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ver = "1.3.296.0"   # bump as needed; LunarG keeps older installers downloadable
+        Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe" -OutFile "$env:RUNNER_TEMP\vulkan.exe"
+        Start-Process -FilePath "$env:RUNNER_TEMP\vulkan.exe" -ArgumentList '--accept-licenses','--default-answer','--confirm-command','install' -Wait
+        "VULKAN_SDK=C:\VulkanSDK\$ver"            | Out-File -FilePath $env:GITHUB_ENV -Append
+        "GLSLC=C:\VulkanSDK\$ver\Bin\glslc.exe"   | Out-File -FilePath $env:GITHUB_ENV -Append
+        "C:\VulkanSDK\$ver\Bin"                   | Out-File -FilePath $env:GITHUB_PATH -Append
+        & "C:\VulkanSDK\$ver\Bin\glslc.exe" --version
