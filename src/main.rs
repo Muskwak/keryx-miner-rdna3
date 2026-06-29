@@ -54,6 +54,41 @@ fn adjust_console() -> Result<(), Error> {
     Ok(())
 }
 
+/// Install a SIGINT/SIGTERM (Ctrl-C on Windows) handler so the miner shuts down cleanly when a
+/// supervisor (HiveOS / systemd / start-miner.bat) stops it, instead of only dying on SIGKILL. The
+/// process holds long GPU dispatches and a resident PoM weight blob; a prompt `exit(0)` lets the OS
+/// reclaim the Vulkan context and returns success so supervisors don't record a crash. `exit` skips
+/// `WeightIndex::drop` (the pom-tree cleanup), but `build_from_gguf` already sweeps every stale
+/// `pom-tree-*.bin` on the next start, so a skipped Drop does not permanently leak a tree.
+fn spawn_shutdown_handler() {
+    tokio::spawn(async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("Could not install SIGTERM handler: {} — only SIGKILL will stop the miner.", e);
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => info!("Received SIGINT (Ctrl-C) — shutting down."),
+                _ = term.recv() => info!("Received SIGTERM — shutting down."),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if tokio::signal::ctrl_c().await.is_err() {
+                log::warn!("Could not listen for the Ctrl-C shutdown signal.");
+                return;
+            }
+            info!("Received Ctrl-C — shutting down.");
+        }
+        std::process::exit(0);
+    });
+}
+
 fn filter_plugins(dirname: &str) -> Vec<String> {
     match fs::read_dir(dirname) {
         Ok(readdir) => readdir
@@ -248,6 +283,9 @@ async fn main() -> Result<(), Error> {
         opt.num_threads = Some(0);
     }
     env_logger::builder().filter_level(opt.log_level()).parse_default_env().init();
+    // Shut down cleanly on SIGINT/SIGTERM (Ctrl-C on Windows) — supervisors stop the miner with
+    // SIGTERM, which previously had no handler and required SIGKILL.
+    spawn_shutdown_handler();
     info!("=================================================================================");
     info!("                 Keryx-Miner GPU {}", env!("CARGO_PKG_VERSION"));
     info!(" Mining for: {}", opt.mining_address.as_deref().unwrap_or("(recovery mode)"));
