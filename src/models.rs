@@ -120,6 +120,12 @@ pub const LLAMA_3_3_70B: ModelSpec = ModelSpec {
 
 /// Map a model_id to its Proof-of-Model tier index, matching the node's `POM_TIERS` order
 /// (Gemma=0, Dolphin=1, Qwen3-32B=2, Llama-70B-abl=3). None for non-PoM models.
+///
+/// NOTE: this slice ordering MUST equal the node's live `POM_TIERS`. The node has not (yet)
+/// defined any "H2" lineup that would prepend a tier and shift these indices; if/when it does,
+/// this mapping must be DAA-gated to match, or every PoM block would carry a stale `tier` and be
+/// rejected. The `R_T`/`N` consensus check (`pinned_pom_anchor`) is keyed by model_id, so it stays
+/// correct across a reorder — but the index emitted in the proof still comes from here.
 pub fn pom_tier_index(model_id: &[u8; 32]) -> Option<u8> {
     if *model_id == GEMMA_3_4B.model_id {
         Some(0)
@@ -132,6 +138,61 @@ pub fn pom_tier_index(model_id: &[u8; 32]) -> Option<u8> {
     } else {
         None
     }
+}
+
+/// Consensus-pinned PoM possession anchor: a model's canonical 32 B-chunk blake3 Merkle root `R_T`
+/// and chunk count `N`, produced offline by `pom-rt-builder`.
+pub struct PomAnchor {
+    pub model_id: [u8; 32],
+    pub root: [u8; 32],
+    pub chunks: u64,
+}
+
+/// Per-model `(R_T, N)` anchors, copied VERBATIM from the node's `POM_TIERS`
+/// (`keryx-node consensus/core/src/config/params.rs`). The miner asserts its freshly-built
+/// possession index matches the pinned `(root, N)` for the model it mines (see
+/// `pom_gpu::ensure_installed_inner`), so a wrong-quant / corrupt / truncated GGUF is caught once
+/// at index-build time — instead of silently producing PoM blocks every one of which the node
+/// rejects with `BadWeightPath`. Keyed by model_id (not slice position) so the check stays correct
+/// even if the node later reorders tiers.
+pub const POM_ANCHORS: &[PomAnchor] = &[
+    PomAnchor {
+        model_id: GEMMA_3_4B.model_id,
+        root: [
+            0x84, 0x6c, 0xaa, 0x40, 0x0c, 0xf0, 0x14, 0x13, 0x21, 0x18, 0x49, 0x5d, 0x22, 0xe4, 0xbf, 0xa2,
+            0x42, 0x45, 0x4e, 0xac, 0x0d, 0x83, 0x5c, 0x3f, 0x8e, 0x63, 0x47, 0xd0, 0x13, 0x9d, 0x1b, 0x7e,
+        ],
+        chunks: 77_604_776,
+    },
+    PomAnchor {
+        model_id: DOLPHIN_LLAMA3_8B.model_id,
+        root: [
+            0x13, 0x3f, 0x62, 0x7b, 0x88, 0x2e, 0xf8, 0x56, 0x78, 0x5a, 0x83, 0x98, 0x6a, 0x9b, 0x1a, 0xdf,
+            0xed, 0xff, 0xf0, 0x74, 0x4a, 0x1f, 0x94, 0x21, 0xec, 0x4d, 0xa6, 0xe9, 0x46, 0x68, 0x15, 0xde,
+        ],
+        chunks: 153_528_426,
+    },
+    PomAnchor {
+        model_id: QWEN3_32B.model_id,
+        root: [
+            0xe2, 0xaa, 0x66, 0x59, 0xaa, 0xb4, 0x38, 0x7e, 0xb5, 0xfd, 0x79, 0x40, 0x9c, 0x0a, 0x1a, 0x68,
+            0x86, 0x3a, 0x3d, 0xef, 0x3b, 0x66, 0x2c, 0xb4, 0x06, 0x16, 0x97, 0xf0, 0xea, 0x87, 0xfa, 0x58,
+        ],
+        chunks: 617_380_448,
+    },
+    PomAnchor {
+        model_id: LLAMA_3_3_70B.model_id,
+        root: [
+            0x53, 0x5f, 0xc2, 0xac, 0xb6, 0x09, 0x7b, 0x5d, 0xf8, 0x83, 0xec, 0x50, 0x66, 0x9a, 0x7f, 0x48,
+            0xdc, 0x9f, 0x3b, 0xd5, 0x98, 0x74, 0x28, 0x59, 0xb8, 0xbb, 0x4c, 0xac, 0x3b, 0x35, 0x26, 0xaa,
+        ],
+        chunks: 1_328_516_616,
+    },
+];
+
+/// The consensus-pinned PoM anchor for `model_id`, if it is a known PoM tier model.
+pub fn pinned_pom_anchor(model_id: &[u8; 32]) -> Option<&'static PomAnchor> {
+    POM_ANCHORS.iter().find(|a| &a.model_id == model_id)
 }
 
 // ── Legacy lineup (pre-OPoI-v2) ───────────────────────────────────────────────
