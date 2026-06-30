@@ -3,11 +3,12 @@
 /// model_id = sha2-256(primary_weight_file) = CIDv0_bytes[2..34].
 /// Verifiable: decode the weight CID from base58btc, skip the 2-byte multihash prefix.
 ///
-/// Uncensored lineup (4 tiers / 4 model families):
-///   --light       Gemma-3-4B-it-abliterated     (Google)  — any GPU (6 GB+)
+/// Uncensored lineup (5 tiers):
+///   --very-light  Qwen3-1.7B-abliterated         (Qwen)   — 4 GB+ GPU (PoM tier 0, post-H2)
+///   --light       Gemma-3-4B-it-abliterated      (Google) — any GPU (6 GB+)
 ///   (default)     Dolphin-3.0-Llama-3.1-8B       (Llama)  — RTX 3060 12GB / 3070
 ///   --high        Qwen3-32B-abliterated (Q4_K_M) (Qwen)   — 24 GB (3090 / 4090 / 5090)
-///   --very-high   Llama-3.3-70B-abliterated      (Meta)   — 48 GB single-GPU
+///   --very-high   Llama-3.3-70B-abliterated      (Meta)   — Q4 48 GB (pre-H2) → Q2_K_L 32 GB / 5090 (post-H2)
 ///
 /// All GGUF weights + tokenizers are pinned on the Keryx IPFS gateway; each
 /// model_id = base58-decode(weight CID)[2..34].
@@ -118,19 +119,99 @@ pub const LLAMA_3_3_70B: ModelSpec = ModelSpec {
     min_vram_mb: 46_000,
 };
 
-/// Map a model_id to its Proof-of-Model tier index, matching the node's `POM_TIERS` order
-/// (Gemma=0, Dolphin=1, Qwen3-32B=2, Llama-70B-abl=3). None for non-PoM models.
-pub fn pom_tier_index(model_id: &[u8; 32]) -> Option<u8> {
-    if *model_id == GEMMA_3_4B.model_id {
-        Some(0)
-    } else if *model_id == DOLPHIN_LLAMA3_8B.model_id {
-        Some(1)
-    } else if *model_id == QWEN3_32B.model_id {
-        Some(2)
-    } else if *model_id == LLAMA_3_3_70B.model_id {
-        Some(3)
+pub const QWEN3_1_7B: ModelSpec = ModelSpec {
+    name: "qwen3-1.7b",
+    // CIDv0[2..34] of model.gguf — mlabonne/Qwen3-1.7B-abliterated Q4_K_M (locally quantized
+    // from the mlabonne safetensors; reproducible: re-quantize Q4_K_M and re-add to verify).
+    model_id: [
+        0x4f, 0x21, 0xdd, 0xeb, 0x7d, 0x62, 0xbd, 0x22,
+        0x65, 0xbc, 0x54, 0x23, 0x0d, 0x53, 0x6c, 0xa3,
+        0xf1, 0x74, 0x99, 0x27, 0x78, 0x0f, 0x52, 0x8c,
+        0x3c, 0x41, 0xfa, 0x29, 0x11, 0xdf, 0x4d, 0x72,
+    ],
+    format: ModelFormat::GgufQwen3,
+    // Qwen3 dense models share the same tokenizer byte-for-byte — identical CID to Qwen3-32B's.
+    tokenizer_cid: "QmcuGkJvR343ry3b4jy7u5L9ior3ujas3yGAFMSyZdACb5",
+    config_cid: "",
+    weight_cids: &["QmTfYsPusQUPG7t82N7tpwFqXuJZ5yCBGsqP19pDJVanh7"],
+    dir_name: "Qwen3-1.7B",
+    // ~1.05 GB Q4_K_M — very-light tier, runs comfortably on 4-6 GB GPUs. Never gated.
+    min_vram_mb: 0,
+};
+
+pub const LLAMA_3_3_70B_Q2: ModelSpec = ModelSpec {
+    name: "llama-3.3-70b-q2",
+    // CIDv0[2..34] of model.gguf — Llama-3.3-70B-Instruct-abliterated Q2_K_L (bartowski, same
+    // base as the Q4_K_M above). Post-H2 very-high tier: fits a 32 GB card (RTX 5090) where the
+    // 42.5 GB Q4 never did, so the top tier is finally servable on real consumer hardware.
+    model_id: [
+        0x6d, 0xf4, 0x6a, 0x78, 0xcb, 0xe4, 0xdc, 0x57,
+        0x9f, 0x04, 0xdb, 0xd8, 0x01, 0xf1, 0xa5, 0x20,
+        0xb9, 0xea, 0xe2, 0x8c, 0xe7, 0xb5, 0x0c, 0x8d,
+        0xa7, 0x87, 0x4b, 0xfa, 0x3f, 0xb5, 0x10, 0x8d,
+    ],
+    format: ModelFormat::Gguf,
+    // Same Llama-3.3 tokenizer as the Q4 (only the quant differs) — already pinned.
+    tokenizer_cid: "QmPd7WQvoQupfzpPVnVVc1Zra5SH4jKnGqNrdTHFtdQuvd",
+    config_cid: "",
+    weight_cids: &["QmVjsK1LBMjk24tawUrGyWUEXHQwkcPgeetC5JpNZL7p1J"],
+    // Distinct dir from the Q4 70B so both coexist on disk across the H2 transition.
+    dir_name: "Llama-3.3-70B-Q2",
+    // ~25.5 GiB Q2_K_L weights + ~2.5 GB KV/workspace ≈ 28 GB → needs a 32 GB card (5090).
+    // Gate at 30 GB so 24 GB cards are excluded (the Q2 is 5090-exclusive).
+    min_vram_mb: 30_000,
+};
+
+/// Map a model_id to its Proof-of-Model tier index, matching the node's `POM_TIERS` order.
+/// DAA-gated at the very-light hardfork (H2) so the index ordering stays logical (smallest = 0):
+///   - daa <  H2 (4-tier): Gemma=0, Dolphin=1, Qwen3-32B=2, Llama-70B-Q4=3.
+///   - daa >= H2 (5-tier): Qwen3-1.7B=0, Gemma=1, Dolphin=2, Qwen3-32B=3, Llama-70B-Q2=4.
+/// At H2 the top tier's model also changes (70B Q4_K_M → Q2_K_L) so it fits a 32 GB 5090.
+/// The gate is mandatory: an archival/IBD node recomputing pre-H2 blocks under the new scheme
+/// would assign different tiers → different reward brackets → UTXO divergence. MUST match the
+/// node, and the tier must be recomputed per block from that block's DAA (not frozen).
+/// Whether `model_id` is one of the Proof-of-Model tier models (any era). DAA-independent —
+/// used at startup to pick a mineable PoM model before any block DAA is known (the tier *index*
+/// is then computed per block via `pom_tier_index`).
+pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
+    *model_id == QWEN3_1_7B.model_id
+        || *model_id == GEMMA_3_4B.model_id
+        || *model_id == DOLPHIN_LLAMA3_8B.model_id
+        || *model_id == QWEN3_32B.model_id
+        || *model_id == LLAMA_3_3_70B.model_id
+        || *model_id == LLAMA_3_3_70B_Q2.model_id
+}
+
+pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
+    if daa >= VERY_LIGHT_ACTIVATION_DAA {
+        // 5-tier scheme: very-light inserted at 0, the existing tiers shift up by one.
+        if *model_id == QWEN3_1_7B.model_id {
+            Some(0)
+        } else if *model_id == GEMMA_3_4B.model_id {
+            Some(1)
+        } else if *model_id == DOLPHIN_LLAMA3_8B.model_id {
+            Some(2)
+        } else if *model_id == QWEN3_32B.model_id {
+            Some(3)
+        } else if *model_id == LLAMA_3_3_70B_Q2.model_id {
+            // Top tier post-H2 = the Q2_K_L (5090-servable), replacing the Q4 (48 GB-only).
+            Some(4)
+        } else {
+            None
+        }
     } else {
-        None
+        // 4-tier scheme (pre-H2): unchanged from OPoI v2.
+        if *model_id == GEMMA_3_4B.model_id {
+            Some(0)
+        } else if *model_id == DOLPHIN_LLAMA3_8B.model_id {
+            Some(1)
+        } else if *model_id == QWEN3_32B.model_id {
+            Some(2)
+        } else if *model_id == LLAMA_3_3_70B.model_id {
+            Some(3)
+        } else {
+            None
+        }
     }
 }
 
@@ -215,8 +296,20 @@ pub const LLAMA_3_3_70B_OFFICIAL: ModelSpec = ModelSpec {
 /// MAINNET_PARAMS.opoi_v2_activation = new(37_780_000).
 pub const OPOI_V2_ACTIVATION_DAA: u64 = 37_780_000;
 
+/// H2 lineup-refresh hardfork activation DAA. MUST match the node. At this score the uncensored
+/// lineup changes in two ways:
+///   - `--very-light` enters as PoM tier 0 (Qwen3-1.7B); before H2 it falls back to the light
+///     tier (Gemma) so an early upgrader still mines a valid tier, and the existing tiers keep
+///     their 4-tier indices.
+///   - `--very-high` swaps Llama-3.3-70B Q4_K_M (48 GB-only) → Q2_K_L (fits a 32 GB 5090).
+/// (Named for very-light for history; it now gates the whole H2 refresh.)
+/// TODO(H2): set the real activation DAA when the hardfork is scheduled (both miner AND node).
+/// `u64::MAX` = effectively disabled (lineup unchanged) until then.
+pub const VERY_LIGHT_ACTIVATION_DAA: u64 = u64::MAX;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
+    VeryLight,
     Light,
     Default,
     High,
@@ -235,14 +328,21 @@ pub fn specs_for(daa: u64, tier: Tier) -> &'static [&'static ModelSpec] {
         // lower tier means unloading the mined model and pausing mining). Multi-tier
         // coverage is a network property (different miners per tier), not a per-GPU one.
         match tier {
+            // Very-light only enters consensus at its own H2; before that it falls back to the
+            // light tier (Gemma) so an early `--very-light` miner still mines a valid tier.
+            Tier::VeryLight if daa >= VERY_LIGHT_ACTIVATION_DAA => &[&QWEN3_1_7B],
+            Tier::VeryLight => &[&GEMMA_3_4B],
             Tier::Light => &[&GEMMA_3_4B],
             Tier::Default => &[&DOLPHIN_LLAMA3_8B],
             Tier::High => &[&QWEN3_32B],
+            // At H2 the top tier swaps Q4_K_M (48 GB-only, effectively unserved) → Q2_K_L so it
+            // fits a 32 GB 5090. Before H2 it stays the Q4 (live today).
+            Tier::VeryHigh if daa >= VERY_LIGHT_ACTIVATION_DAA => &[&LLAMA_3_3_70B_Q2],
             Tier::VeryHigh => &[&LLAMA_3_3_70B],
         }
     } else {
         match tier {
-            Tier::Light => &[&TINYLLAMA],
+            Tier::VeryLight | Tier::Light => &[&TINYLLAMA],
             Tier::Default => &[&TINYLLAMA, &DEEPSEEK_R1_8B],
             Tier::High => &[&TINYLLAMA, &DEEPSEEK_R1_8B, &DEEPSEEK_R1_32B],
             Tier::VeryHigh => &[&TINYLLAMA, &DEEPSEEK_R1_8B, &DEEPSEEK_R1_32B, &LLAMA_3_3_70B_OFFICIAL],
@@ -256,6 +356,8 @@ pub const REGISTRY: &[&ModelSpec] = &[
     &DOLPHIN_LLAMA3_8B,
     &QWEN3_32B,
     &LLAMA_3_3_70B,
+    &LLAMA_3_3_70B_Q2,
+    &QWEN3_1_7B,
     &TINYLLAMA,
     &DEEPSEEK_R1_8B,
     &DEEPSEEK_R1_32B,
