@@ -311,8 +311,11 @@ impl MinerManager {
                         };
                         // An inference may have evicted the mining model (inference has priority).
                         // Rebuild the walk (reloads the model resident) before mining resumes.
+                        // Thread the live DAA so the host index computes the correct PoM tier (H2
+                        // 5-tier vs pre-H2 4-tier) — see ensure_installed doc.
                         if !keryx_miner::pom_gpu::is_installed() {
-                            keryx_miner::pom_gpu::ensure_installed();
+                            let daa = state.as_ref().map_or(0, |s| s.daa_score);
+                            keryx_miner::pom_gpu::ensure_installed(daa);
                         }
                         let found = keryx_miner::pom_gpu::mine(&pph, time, &target_le, pom_nonce, POM_BATCH);
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
