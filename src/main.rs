@@ -362,15 +362,10 @@ async fn main() -> Result<(), Error> {
         info!("default mode: mines Dolphin-8B under PoM.");
         keryx_miner::models::Tier::Default
     };
-    // OPoI v2 hardfork: the model lineup is DAA-gated (mirrors the node's
-    // opoi_v2_activation). Stage BOTH lineups for this tier — each filtered by what
-    // this hardware can serve (layer-A capability gate) — so the chain crossing
-    // hot-swaps without a restart:
-    //   - legacy (daa < H) is prefetched now and mined immediately;
-    //   - uncensored (daa >= H) is prefetched in the background and swapped in at H.
-    // `specs_v1` is the CURRENT (legacy, daa < H) lineup the miner announces and serves until the
-    // chain crosses H — `specs_for(0, ..)` so a fresh chain declares the legacy models.
-    let specs_v1 = filter_specs_by_vram(keryx_miner::models::specs_for(0, tier));
+    // OPoI-v2 is in the PAST on mainnet (chain DAA is well beyond OPOI_V2_ACTIVATION_DAA), so the
+    // legacy (pre-fork) lineup is dead — nobody serves it and it must not be downloaded. Stage ONLY
+    // the uncensored lineup (`specs_for(OPOI_V2_ACTIVATION_DAA, ..)` = the currently-served models),
+    // filtered by what this hardware can serve (layer-A capability gate).
     let specs_v2 = filter_specs_by_vram(
         keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
     );
@@ -381,52 +376,22 @@ async fn main() -> Result<(), Error> {
         specs_v2
             .iter()
             .copied()
-            .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id).is_some())
+            .filter(|s| keryx_miner::models::is_pom_model(&s.model_id))
             .max_by_key(|s| s.min_vram_mb)
     } else {
         None
     };
     keryx_miner::slm::set_v2_lineup(specs_v2);
-    keryx_miner::slm::init_supported(specs_v1);
+    keryx_miner::slm::init_supported(specs_v2);
     log::debug!(
-        "OPoI Phase-3 active — {} legacy + {} uncensored model(s) staged, DAA-gated at {}.",
-        specs_v1.len(),
+        "OPoI Phase-3 active — {} uncensored model(s) staged (legacy lineup dropped, post-fork).",
         specs_v2.len(),
-        keryx_miner::models::OPOI_V2_ACTIVATION_DAA
     );
-    // Block on BOTH lineups before mining: never start hashing while a model this miner
-    // will serve — the legacy set now AND the uncensored set after the hardfork swap — is
-    // still downloading. The readiness-gated swap then activates v2 instantly at H.
+    // Block on the uncensored lineup before mining: never start hashing while a model this miner
+    // will serve is still downloading. The legacy (pre-fork) lineup is dead and never downloaded.
     if keryx_miner::pow_only() {
         info!("PoW-only mode (KERYX_POW_ONLY): skipping OPoI model prefetch + inference probe.");
     } else {
-    // KERYX_SKIP_LEGACY_MODELS=1 — don't download the pre-fork (legacy) lineup. Useful when you
-    // only intend to mine post-fork PoM and don't want to fetch models that retire at H. Pre-fork
-    // OPoI mining is then DISABLED (the gate has no ready legacy model); the uncensored lineup still
-    // downloads and swaps in at H, so PoM mining starts on schedule.
-    let skip_legacy = std::env::var("KERYX_SKIP_LEGACY_MODELS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if skip_legacy {
-        log::warn!(
-            "KERYX_SKIP_LEGACY_MODELS set — skipping the legacy lineup ({} model(s)). Pre-fork OPoI \
-             mining DISABLED; PoM mining starts at DAA {} once the uncensored lineup swaps in.",
-            specs_v1.len(),
-            keryx_miner::models::OPOI_V2_ACTIVATION_DAA
-        );
-    } else {
-        match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await {
-            Ok(Ok(())) => log::debug!("Legacy model files ready."),
-            Ok(Err(e)) => {
-                error!("Model prefetch failed — refusing to mine without inference capability: {}", e);
-                return Err(e.into());
-            }
-            Err(e) => {
-                error!("Model prefetch task panicked: {}", e);
-                return Err(e.into());
-            }
-        }
-    }
     match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v2)).await {
         Ok(Ok(())) => info!("Model files ready — starting mining."),
         Ok(Err(e)) => {
@@ -443,14 +408,14 @@ async fn main() -> Result<(), Error> {
     // immediately). The possession index AND the GPU walk are built by the mining loop the first
     // time PoM is active (DAA >= POM_ACTIVATION_DAA). Here we only record cheap config.
     if let Some(spec) = pom_spec {
-        let tier = keryx_miner::models::pom_tier_index(&spec.model_id).expect("pom_spec has a tier");
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         // Force the single-device split loader so the mining tier exposes its quant tensors for
-        // zero-dup sharing, and record the tier so the walk can be built on demand.
+        // zero-dup sharing. The PoM tier index is computed per block from the block DAA (it shifts
+        // at the very-light H2 hardfork), so it is not recorded here — only the model.
         keryx_miner::slm::set_pom_force_split(true);
         keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
-        info!("PoM: configured for tier {} ({}); index + GPU walk load lazily when PoM activates (DAA {}).",
-            tier, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
+        info!("PoM: configured to mine {}; index + GPU walk load lazily when PoM activates (DAA {}).",
+            spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
     }
 
     // Verify the Vulkan inference backend before mining. OPoI challenges are mandatory, so a miner

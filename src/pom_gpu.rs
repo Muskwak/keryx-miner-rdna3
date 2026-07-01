@@ -83,7 +83,8 @@ fn ensure_installed_inner() -> bool {
     // Build the host possession index once (heavy: hashes every chunk to a disk Merkle tree).
     // Needed to construct the PoM proof for a winning nonce.
     if crate::pom::active_index().is_none() {
-        let tier = match crate::models::pom_tier_index(model_id) {
+        // The very-light H2 is not yet active (DAA = u64::MAX), so the 4-tier scheme applies.
+        let tier = match crate::models::pom_tier_index(model_id, 0) {
             Some(t) => t,
             None => return false,
         };
