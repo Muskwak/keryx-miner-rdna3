@@ -64,27 +64,34 @@ pub fn mine(pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start
 
 /// Ensure the GPU PoM miner is installed; build the host possession index (first activation) and
 /// upload the weight blob to VRAM if needed. Returns true when ready to mine.
-pub fn ensure_installed() -> bool {
+///
+/// `daa` MUST be the current block's live DAA score — the host index's tier byte is baked into
+/// `pom::POM_INDEX` (a `OnceLock`) on first build and reused for every proof afterwards, so if
+/// this is called with a stale/wrong DAA at startup the miner declares the wrong tier for the
+/// rest of the process's life (BadWeightPath / "block invalid" on every submission, exactly like
+/// the pre-H2/post-H2 tier-index regression on the CUDA fork).
+pub fn ensure_installed(daa: u64) -> bool {
     if is_installed() {
         return true;
     }
     LOADING.store(true, Ordering::Relaxed);
-    let ok = ensure_installed_inner();
+    let ok = ensure_installed_inner(daa);
     LOADING.store(false, Ordering::Relaxed);
     ok
 }
 
-fn ensure_installed_inner() -> bool {
+fn ensure_installed_inner(daa: u64) -> bool {
     let (model_id, gguf) = match MINING_TIER.get() {
         Some(x) => x,
         None => return false,
     };
 
     // Build the host possession index once (heavy: hashes every chunk to a disk Merkle tree).
-    // Needed to construct the PoM proof for a winning nonce.
+    // Needed to construct the PoM proof for a winning nonce. Tier must be computed from the
+    // REAL current DAA (not a fixed 0) so it lands on the node's active tier scheme (pre- or
+    // post-H2) — see the `daa` doc comment above.
     if crate::pom::active_index().is_none() {
-        // The very-light H2 is not yet active (DAA = u64::MAX), so the 4-tier scheme applies.
-        let tier = match crate::models::pom_tier_index(model_id, 0) {
+        let tier = match crate::models::pom_tier_index(model_id, daa) {
             Some(t) => t,
             None => return false,
         };

@@ -303,9 +303,13 @@ pub const OPOI_V2_ACTIVATION_DAA: u64 = 37_780_000;
 ///     their 4-tier indices.
 ///   - `--very-high` swaps Llama-3.3-70B Q4_K_M (48 GB-only) → Q2_K_L (fits a 32 GB 5090).
 /// (Named for very-light for history; it now gates the whole H2 refresh.)
-/// TODO(H2): set the real activation DAA when the hardfork is scheduled (both miner AND node).
-/// `u64::MAX` = effectively disabled (lineup unchanged) until then.
-pub const VERY_LIGHT_ACTIVATION_DAA: u64 = u64::MAX;
+/// Mainnet: 38_951_445, matching the node's `very_light_activation` in
+/// `consensus/core/src/config/params.rs`. The network crossed this DAA ~2026-06-28, switching
+/// the node to the 5-tier H2 `POM_TIERS_H2` table (Gemma moves from tier 0 to tier 1). A miner
+/// still on `u64::MAX` here declares Gemma proofs as tier 0, which the node now verifies against
+/// tier 0's (Qwen3-1.7B) root/chunks -> BadWeightPath / "failed to submit block, block invalid"
+/// on every share. See the CUDA fork's identical fix (models.rs VERY_LIGHT_ACTIVATION_DAA).
+pub const VERY_LIGHT_ACTIVATION_DAA: u64 = 38_951_445;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
