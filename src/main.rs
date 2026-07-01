@@ -379,10 +379,11 @@ async fn main() -> Result<(), Error> {
     // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
     // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
     // property, not a per-GPU one.
+    //   --very-light → Qwen3-1.7B   (PoM tier 0, post-H2)
     //   (no flag)    → Dolphin-8B   [default]
     //   --light      → Gemma-3-4B
     //   --high       → Qwen3-32B
-    //   --very-high  → Llama-3.3-70B
+    //   --very-high  → Llama-3.3-70B (Q4 pre-H2 → Q2_K_L post-H2)
 
     // Warn if GPU 0's VRAM is too small for the selected model tier (Vulkan-queried).
     check_gpu_vram_for_tier(opt.high || opt.very_high, opt.very_high);
@@ -396,6 +397,9 @@ async fn main() -> Result<(), Error> {
     } else if opt.light {
         info!("--light mode: baseline tier — mines Gemma-3-4B under PoM.");
         keryx_miner::models::Tier::Light
+    } else if opt.very_light {
+        info!("--very-light mode: entry tier — mines Qwen3-1.7B under PoM (post-H2; falls back to Gemma-3-4B before H2).");
+        keryx_miner::models::Tier::VeryLight
     } else {
         info!("default mode: mines Dolphin-8B under PoM.");
         keryx_miner::models::Tier::Default
@@ -409,8 +413,12 @@ async fn main() -> Result<(), Error> {
     // `specs_v1` is the CURRENT (legacy, daa < H) lineup the miner announces and serves until the
     // chain crosses H — `specs_for(0, ..)` so a fresh chain declares the legacy models.
     let specs_v1 = filter_specs_by_vram(keryx_miner::models::specs_for(0, tier));
+    // Stage the FINAL (post-H2) lineup directly — `specs_for(VERY_LIGHT_ACTIVATION_DAA, ..)` returns
+    // the latest model for the tier. For light/default/high this is identical to the OPoI-v2 model
+    // (unchanged at H2); for `--very-light` it stages Qwen3-1.7B and for `--very-high` the Q2_K_L.
+    // The chain relaunches directly into H2, so the post-H2 model is the one that must be resident.
     let specs_v2 = filter_specs_by_vram(
-        keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
+        keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, tier),
     );
     // PoM: pick the highest tier this miner serves that has a pinned R_T (the model it will
     // mine under possession). Captured before `specs_v2` is consumed; the index is built after
@@ -419,7 +427,7 @@ async fn main() -> Result<(), Error> {
         specs_v2
             .iter()
             .copied()
-            .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id).is_some())
+            .filter(|s| keryx_miner::models::is_pom_model(&s.model_id))
             .max_by_key(|s| s.min_vram_mb)
     } else {
         None
@@ -481,14 +489,15 @@ async fn main() -> Result<(), Error> {
     // immediately). The possession index AND the GPU walk are built by the mining loop the first
     // time PoM is active (DAA >= POM_ACTIVATION_DAA). Here we only record cheap config.
     if let Some(spec) = pom_spec {
-        let tier = keryx_miner::models::pom_tier_index(&spec.model_id).expect("pom_spec has a tier");
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         // Force the single-device split loader so the mining tier exposes its quant tensors for
-        // zero-dup sharing, and record the tier so the walk can be built on demand.
+        // zero-dup sharing, and record the mining MODEL so the walk can be built on demand. The PoM
+        // tier INDEX is computed per block from the block DAA (`pom_gpu::current_tier`), not frozen
+        // here — it reindexes at H2, so a startup-frozen value would be wrong post-fork.
         keryx_miner::slm::set_pom_force_split(true);
         keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
-        info!("PoM: configured for tier {} ({}); index + GPU walk load lazily when PoM activates (DAA {}).",
-            tier, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
+        info!("PoM: configured to mine {} under possession; index + GPU walk load lazily when PoM activates (DAA {}).",
+            spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
     }
 
     // Verify the Vulkan inference backend before mining. OPoI challenges are mandatory, so a miner

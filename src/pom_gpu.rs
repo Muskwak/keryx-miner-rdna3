@@ -69,17 +69,27 @@ pub fn mine(pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start
 
 /// Ensure the GPU PoM miner is installed; build the host possession index (first activation) and
 /// upload the weight blob to VRAM if needed. Returns true when ready to mine.
-pub fn ensure_installed() -> bool {
+pub fn ensure_installed(daa: u64) -> bool {
     if is_installed() {
         return true;
     }
     LOADING.store(true, Ordering::Relaxed);
-    let ok = ensure_installed_inner();
+    let ok = ensure_installed_inner(daa);
     LOADING.store(false, Ordering::Relaxed);
     ok
 }
 
-fn ensure_installed_inner() -> bool {
+/// PoM tier index of the mining model at a given block DAA. Recomputed per block (not frozen at
+/// index-build time) so the tier reindexing at the very-light hardfork (H2) is applied at the
+/// exact boundary — e.g. Gemma 0→1 — rather than from a stale build-time value. The proof's `tier`
+/// field MUST come from here, keyed on the block's own DAA, or a post-H2 block carries the stale
+/// 4-tier index and the node rejects it (`BadWeightPath`).
+pub fn current_tier(daa: u64) -> Option<u8> {
+    let (model_id, _) = MINING_TIER.get()?;
+    crate::models::pom_tier_index(model_id, daa)
+}
+
+fn ensure_installed_inner(daa: u64) -> bool {
     let (model_id, gguf) = match MINING_TIER.get() {
         Some(x) => x,
         None => return false,
@@ -88,7 +98,10 @@ fn ensure_installed_inner() -> bool {
     // Build the host possession index once (heavy: hashes every chunk to a disk Merkle tree).
     // Needed to construct the PoM proof for a winning nonce.
     if crate::pom::active_index().is_none() {
-        let tier = match crate::models::pom_tier_index(model_id) {
+        // Build-time tier is used only for logging + the get_or_build_index/set_index bookkeeping;
+        // the tier EMITTED in each proof is recomputed per block via `current_tier(daa)`. `daa` here
+        // is the block DAA at first activation (>= POM_ACTIVATION_DAA, guaranteed by the caller).
+        let tier = match crate::models::pom_tier_index(model_id, daa) {
             Some(t) => t,
             None => return false,
         };
