@@ -17,6 +17,17 @@ use keryx_miner::{PluginManager, WorkerSpec};
 
 type MinerHandler = std::thread::JoinHandle<Result<(), Error>>;
 
+/// Grace period a worker gets to observe `Close` and return on its own before the freeze
+/// handler force-kills it. It MUST exceed the worst-case *uninterruptible* op — a one-time GPU
+/// VRAM blob load, which is a synchronous Vulkan upload that can take tens of seconds for a large
+/// model and cannot poll `Close` mid-call. Too short and the watchdog kills a worker mid-load: on
+/// Windows `kernel32::TerminateThread` destroys the thread without letting std write its result, so
+/// the drop's `join()` then panics ("threads should not terminate unexpectedly") and crashes the
+/// whole process on every reconnect. In steady state a worker checks `Close` between mining batches
+/// and exits in well under a second, so this ceiling only ever applies mid-load — it adds no delay
+/// to a normal reconnect. 60s covers any RDNA3-servable model's load with margin.
+const FREEZE_GRACE: Duration = Duration::from_secs(60);
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C" fn signal_panic(_signal: nix::libc::c_int) {
     panic!("Forced shutdown");
@@ -35,7 +46,7 @@ fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -
     use std::os::unix::thread::JoinHandleExt;
     let pthread_handle = handle.as_pthread_t();
     std::thread::spawn(move || {
-        sleep(Duration::from_millis(1000));
+        sleep(FREEZE_GRACE);
         if kill_switch.load(Ordering::SeqCst) {
             match nix::sys::pthread::pthread_kill(pthread_handle, nix::sys::signal::Signal::SIGUSR1) {
                 Ok(()) => {
@@ -65,7 +76,7 @@ fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -
 
     std::thread::spawn(move || unsafe {
         let ensure_full_move = raw_handle;
-        sleep(Duration::from_millis(1000));
+        sleep(FREEZE_GRACE);
         if kill_switch.load(Ordering::SeqCst) {
             kernel32::TerminateThread(ensure_full_move.0, 0);
         }
@@ -302,19 +313,18 @@ impl MinerManager {
                             }
                             continue;
                         }
-                        let (pph, time, target_le) = {
+                        let (pph, time, target_le, daa) = {
                             let s = state.as_ref().unwrap();
                             let mut pph = [0u8; 32];
                             pph.copy_from_slice(&s.pow_hash_header[0..32]);
                             let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
-                            (pph, time, s.target.to_le_bytes())
+                            (pph, time, s.target.to_le_bytes(), s.daa_score)
                         };
                         // An inference may have evicted the mining model (inference has priority).
                         // Rebuild the walk (reloads the model resident) before mining resumes.
                         // Thread the live DAA so the host index computes the correct PoM tier (H2
                         // 5-tier vs pre-H2 4-tier) — see ensure_installed doc.
                         if !keryx_miner::pom_gpu::is_installed() {
-                            let daa = state.as_ref().map_or(0, |s| s.daa_score);
                             keryx_miner::pom_gpu::ensure_installed(daa);
                         }
                         let found = keryx_miner::pom_gpu::mine(&pph, time, &target_le, pom_nonce, POM_BATCH);
@@ -322,8 +332,13 @@ impl MinerManager {
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         if let Some(nonce) = found {
+                            // Emit the tier for THIS block's DAA (not the frozen build-time tier) so the
+                            // index reindexing at H2 is applied at the exact boundary — else the node
+                            // rejects the proof (BadWeightPath).
                             let built = state.as_ref().and_then(|s| {
-                                keryx_miner::pom::active_index().and_then(|(idx, tier)| s.generate_block_if_pom(nonce, idx, *tier))
+                                let (idx, _) = keryx_miner::pom::active_index()?;
+                                let tier = keryx_miner::pom_gpu::current_tier(s.daa_score)?;
+                                s.generate_block_if_pom(nonce, idx, tier)
                             });
                             if let Some(block_seed) = built {
                                 match send_channel.blocking_send(block_seed.clone()) {
@@ -471,9 +486,14 @@ impl MinerManager {
                     };
                     nonce = (nonce & mask) | fixed;
 
-                    // PoM possession path (CPU) once active; else legacy kHeavyHash.
+                    // PoM possession path (CPU) once active; else legacy kHeavyHash. The proof tier is
+                    // recomputed from this block's DAA (per-block, not the frozen build-time tier) so
+                    // the H2 reindex is applied at the boundary — else the node rejects (BadWeightPath).
                     let found = if state_ref.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA {
-                        keryx_miner::pom::active_index().and_then(|(idx, tier)| state_ref.generate_block_if_pom(nonce.0, idx, *tier))
+                        keryx_miner::pom::active_index().and_then(|(idx, _)| {
+                            let tier = keryx_miner::pom_gpu::current_tier(state_ref.daa_score)?;
+                            state_ref.generate_block_if_pom(nonce.0, idx, tier)
+                        })
                     } else {
                         state_ref.generate_block_if_pow(nonce.0)
                     };

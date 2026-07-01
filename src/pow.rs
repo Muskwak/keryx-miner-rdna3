@@ -201,6 +201,21 @@ impl State {
             |o| index.read_chunk(o),
             |o| index.merkle_path(o),
         );
+
+        // Cheap insurance: run the node's exact weightless verifier over the freshly built proof
+        // before submit. A self-verify failure means a GPU↔CPU fold drift or a Merkle-path bug —
+        // submitting it would just earn a node rejection, so drop the block and log loudly instead.
+        let target_le = self.target.to_le_bytes();
+        if !pom::verify_proof(&pph, nonce, seed, &proof, index.n_chunks, pom::POM_WALK_STEPS, pom::POM_OPENINGS, &index.r_t, &target_le)
+        {
+            log::error!(
+                "PoM: self-verify FAILED for winning nonce {} — dropping block instead of submitting a \
+                 proof the node would reject. Indicates a GPU/CPU walk-fold or Merkle-path mismatch.",
+                nonce
+            );
+            return None;
+        }
+
         let bytes = borsh::to_vec(&proof).ok()?;
 
         let mut block_seed = (*self.block).clone();

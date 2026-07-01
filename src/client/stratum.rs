@@ -187,13 +187,15 @@ impl Client for StratumHandler {
                 id,
                 payload: StratumLinePayload::StratumCommand(StratumCommand::Subscribe(
                     MiningSubscribe::MiningSubscribeOptions((
-                        // suprnova's bridge version-gates PoM shares: it rejects miners reporting
-                        // below keryx-miner-supr/0.6.3 ("v0.6.1/v0.6.2 do NOT generate valid PoM
-                        // proofs — upgrade to 0.6.3+") even when the proof is valid. We ported
-                        // 0.6.3's Short-notify daa fix above and have had shares accepted, so we are
-                        // 0.6.3-equivalent — advertise the identity the pool requires so the gate
-                        // passes. (Real build: keryx-miner/CARGO_PKG_VERSION.)
-                        "keryx-miner-supr/0.6.3".to_string(),
+                        // suprnova's bridge version-gates PoM shares by the reported keryx-miner-supr
+                        // version. Post-H2 (keryxd v1.2.9, DAA 38_951_445) it rejects any build
+                        // <= v0.6.3.6 as pre-H2 ("uses the pre-H2 4-tier POM index … every submit is
+                        // rejected as BadWeightPath") — the gate now demands STRICTLY > v0.6.3.6.
+                        // This build IS H2-aware: `pom_tier_index`/`current_tier` emit the DAA-gated
+                        // 5-tier index (see models.rs VERY_LIGHT_ACTIVATION_DAA), so advertise the
+                        // first strictly-greater version to clear the gate. Bump this single string
+                        // if the pool later raises the floor. (Real build: keryx-miner/CARGO_PKG_VERSION.)
+                        "keryx-miner-supr/0.6.3.7".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),

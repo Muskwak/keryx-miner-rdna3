@@ -182,6 +182,19 @@ pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
         || *model_id == LLAMA_3_3_70B_Q2.model_id
 }
 
+
+/// Map a model_id to its Proof-of-Model tier index, matching the node's `POM_TIERS` order.
+/// DAA-gated at the very-light hardfork (H2) so the index ordering stays logical (smallest = 0):
+///   - daa <  H2 (4-tier): Gemma=0, Dolphin=1, Qwen3-32B=2, Llama-70B-Q4=3.
+///   - daa >= H2 (5-tier): Qwen3-1.7B=0, Gemma=1, Dolphin=2, Qwen3-32B=3, Llama-70B-Q2=4.
+/// At H2 the top tier's model also changes (70B Q4_K_M → Q2_K_L) so it fits a 32 GB 5090.
+/// The gate is MANDATORY and MUST match the node's `pom_tiers(very_light_active)`: an
+/// archival/IBD node recomputing pre-H2 blocks under the new scheme would assign different tiers
+/// → different reward brackets → UTXO divergence. The tier MUST be recomputed per block from that
+/// block's own DAA (never frozen at index-build time), or a post-H2 block would carry the stale
+/// 4-tier index and be rejected. The `R_T`/`N` consensus check (`pinned_pom_anchor`) is keyed by
+/// model_id, so it stays correct across the reorder — but the index emitted in the proof comes
+/// from here. None for non-PoM models.
 pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     if daa >= VERY_LIGHT_ACTIVATION_DAA {
         // 5-tier scheme: very-light inserted at 0, the existing tiers shift up by one.
@@ -213,6 +226,80 @@ pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
             None
         }
     }
+}
+
+/// Consensus-pinned PoM possession anchor: a model's canonical 32 B-chunk blake3 Merkle root `R_T`
+/// and chunk count `N`, produced offline by `pom-rt-builder`.
+pub struct PomAnchor {
+    pub model_id: [u8; 32],
+    pub root: [u8; 32],
+    pub chunks: u64,
+}
+
+/// Per-model `(R_T, N)` anchors, copied VERBATIM from the node's `POM_TIERS`
+/// (`keryx-node consensus/core/src/config/params.rs`). The miner asserts its freshly-built
+/// possession index matches the pinned `(root, N)` for the model it mines (see
+/// `pom_gpu::ensure_installed_inner`), so a wrong-quant / corrupt / truncated GGUF is caught once
+/// at index-build time — instead of silently producing PoM blocks every one of which the node
+/// rejects with `BadWeightPath`. Keyed by model_id (not slice position) so the check stays correct
+/// even if the node later reorders tiers.
+pub const POM_ANCHORS: &[PomAnchor] = &[
+    PomAnchor {
+        model_id: GEMMA_3_4B.model_id,
+        root: [
+            0x84, 0x6c, 0xaa, 0x40, 0x0c, 0xf0, 0x14, 0x13, 0x21, 0x18, 0x49, 0x5d, 0x22, 0xe4, 0xbf, 0xa2,
+            0x42, 0x45, 0x4e, 0xac, 0x0d, 0x83, 0x5c, 0x3f, 0x8e, 0x63, 0x47, 0xd0, 0x13, 0x9d, 0x1b, 0x7e,
+        ],
+        chunks: 77_604_776,
+    },
+    PomAnchor {
+        model_id: DOLPHIN_LLAMA3_8B.model_id,
+        root: [
+            0x13, 0x3f, 0x62, 0x7b, 0x88, 0x2e, 0xf8, 0x56, 0x78, 0x5a, 0x83, 0x98, 0x6a, 0x9b, 0x1a, 0xdf,
+            0xed, 0xff, 0xf0, 0x74, 0x4a, 0x1f, 0x94, 0x21, 0xec, 0x4d, 0xa6, 0xe9, 0x46, 0x68, 0x15, 0xde,
+        ],
+        chunks: 153_528_426,
+    },
+    PomAnchor {
+        model_id: QWEN3_32B.model_id,
+        root: [
+            0xe2, 0xaa, 0x66, 0x59, 0xaa, 0xb4, 0x38, 0x7e, 0xb5, 0xfd, 0x79, 0x40, 0x9c, 0x0a, 0x1a, 0x68,
+            0x86, 0x3a, 0x3d, 0xef, 0x3b, 0x66, 0x2c, 0xb4, 0x06, 0x16, 0x97, 0xf0, 0xea, 0x87, 0xfa, 0x58,
+        ],
+        chunks: 617_380_448,
+    },
+    PomAnchor {
+        model_id: LLAMA_3_3_70B.model_id,
+        root: [
+            0x53, 0x5f, 0xc2, 0xac, 0xb6, 0x09, 0x7b, 0x5d, 0xf8, 0x83, 0xec, 0x50, 0x66, 0x9a, 0x7f, 0x48,
+            0xdc, 0x9f, 0x3b, 0xd5, 0x98, 0x74, 0x28, 0x59, 0xb8, 0xbb, 0x4c, 0xac, 0x3b, 0x35, 0x26, 0xaa,
+        ],
+        chunks: 1_328_516_616,
+    },
+    // ── H2 (post-`very_light_activation`) anchors — copied VERBATIM from the node's `POM_TIERS_H2`
+    // (keryx-node consensus/core/src/config/params.rs). Keyed by model_id, so they coexist with the
+    // pre-H2 anchors above and `pinned_pom_anchor` resolves the right one regardless of tier order.
+    PomAnchor {
+        model_id: QWEN3_1_7B.model_id,
+        root: [
+            0xd0, 0x9a, 0x0b, 0x1c, 0x26, 0x25, 0x69, 0xc2, 0x39, 0xfa, 0xcc, 0xf6, 0x41, 0xf8, 0xe4, 0x35,
+            0x4a, 0x15, 0x77, 0x50, 0x1b, 0xa8, 0x42, 0xbc, 0x64, 0x9a, 0x87, 0x6d, 0xe1, 0xaf, 0x9a, 0x5d,
+        ],
+        chunks: 34_420_544,
+    },
+    PomAnchor {
+        model_id: LLAMA_3_3_70B_Q2.model_id,
+        root: [
+            0xb9, 0x6c, 0xfc, 0xb5, 0x38, 0xae, 0xb0, 0x66, 0xa1, 0x8c, 0xea, 0xa1, 0x1c, 0x8b, 0x1a, 0x04,
+            0x4f, 0x91, 0x32, 0x40, 0x8e, 0x87, 0x04, 0x8e, 0xb7, 0x41, 0xfe, 0x73, 0xed, 0x1b, 0xf6, 0x18,
+        ],
+        chunks: 856_040_456,
+    },
+];
+
+/// The consensus-pinned PoM anchor for `model_id`, if it is a known PoM tier model.
+pub fn pinned_pom_anchor(model_id: &[u8; 32]) -> Option<&'static PomAnchor> {
+    POM_ANCHORS.iter().find(|a| &a.model_id == model_id)
 }
 
 // ── Legacy lineup (pre-OPoI-v2) ───────────────────────────────────────────────
@@ -296,19 +383,21 @@ pub const LLAMA_3_3_70B_OFFICIAL: ModelSpec = ModelSpec {
 /// MAINNET_PARAMS.opoi_v2_activation = new(37_780_000).
 pub const OPOI_V2_ACTIVATION_DAA: u64 = 37_780_000;
 
-/// H2 lineup-refresh hardfork activation DAA. MUST match the node. At this score the uncensored
-/// lineup changes in two ways:
+/// H2 lineup-refresh hardfork activation DAA. MUST match the node's `very_light_activation`
+/// (keryx-node MAINNET_PARAMS = new(38_951_445)). At this score the uncensored lineup changes:
 ///   - `--very-light` enters as PoM tier 0 (Qwen3-1.7B); before H2 it falls back to the light
 ///     tier (Gemma) so an early upgrader still mines a valid tier, and the existing tiers keep
 ///     their 4-tier indices.
 ///   - `--very-high` swaps Llama-3.3-70B Q4_K_M (48 GB-only) → Q2_K_L (fits a 32 GB 5090).
-/// (Named for very-light for history; it now gates the whole H2 refresh.)
+/// The node bundles a difficulty reset at this SAME DAA (the chain froze at pom_activation), so the
+/// chain relaunches directly into the 5-tier scheme — the first re-mined blocks are H2 blocks.
 /// Mainnet: 38_951_445, matching the node's `very_light_activation` in
 /// `consensus/core/src/config/params.rs`. The network crossed this DAA ~2026-06-28, switching
 /// the node to the 5-tier H2 `POM_TIERS_H2` table (Gemma moves from tier 0 to tier 1). A miner
 /// still on `u64::MAX` here declares Gemma proofs as tier 0, which the node now verifies against
-/// tier 0's (Qwen3-1.7B) root/chunks -> BadWeightPath / "failed to submit block, block invalid"
-/// on every share. See the CUDA fork's identical fix (models.rs VERY_LIGHT_ACTIVATION_DAA).
+/// tier 0's (Qwen3-1.7B) root/chunks -> BadWeightPath on every share. See the CUDA fork's
+/// identical fix (models.rs VERY_LIGHT_ACTIVATION_DAA).
+/// (Named for very-light for history; it now gates the whole H2 refresh.)
 pub const VERY_LIGHT_ACTIVATION_DAA: u64 = 38_951_445;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -374,4 +463,64 @@ pub fn find(name: &str) -> Option<&'static ModelSpec> {
 
 pub fn available_names() -> Vec<&'static str> {
     REGISTRY.iter().map(|m| m.name).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The H2 gate is consensus-critical: the tier index emitted in each PoM proof MUST match the
+    // node's `pom_tiers(very_light_active)` per the block's own DAA. These lock the 4→5 tier reindex.
+    const PRE_H2: u64 = VERY_LIGHT_ACTIVATION_DAA - 1;
+    const AT_H2: u64 = VERY_LIGHT_ACTIVATION_DAA;
+
+    #[test]
+    fn pom_tier_index_pre_h2_is_4_tier() {
+        assert_eq!(pom_tier_index(&GEMMA_3_4B.model_id, PRE_H2), Some(0));
+        assert_eq!(pom_tier_index(&DOLPHIN_LLAMA3_8B.model_id, PRE_H2), Some(1));
+        assert_eq!(pom_tier_index(&QWEN3_32B.model_id, PRE_H2), Some(2));
+        assert_eq!(pom_tier_index(&LLAMA_3_3_70B.model_id, PRE_H2), Some(3));
+        // The H2-only models are not in the pre-H2 tier set.
+        assert_eq!(pom_tier_index(&QWEN3_1_7B.model_id, PRE_H2), None);
+        assert_eq!(pom_tier_index(&LLAMA_3_3_70B_Q2.model_id, PRE_H2), None);
+    }
+
+    #[test]
+    fn pom_tier_index_at_h2_is_5_tier() {
+        assert_eq!(pom_tier_index(&QWEN3_1_7B.model_id, AT_H2), Some(0));
+        assert_eq!(pom_tier_index(&GEMMA_3_4B.model_id, AT_H2), Some(1));
+        assert_eq!(pom_tier_index(&DOLPHIN_LLAMA3_8B.model_id, AT_H2), Some(2));
+        assert_eq!(pom_tier_index(&QWEN3_32B.model_id, AT_H2), Some(3));
+        assert_eq!(pom_tier_index(&LLAMA_3_3_70B_Q2.model_id, AT_H2), Some(4));
+        // The Q4 70B is replaced by the Q2 at the top tier post-H2.
+        assert_eq!(pom_tier_index(&LLAMA_3_3_70B.model_id, AT_H2), None);
+    }
+
+    #[test]
+    fn is_pom_model_covers_both_eras() {
+        for m in [&GEMMA_3_4B, &DOLPHIN_LLAMA3_8B, &QWEN3_32B, &LLAMA_3_3_70B, &QWEN3_1_7B, &LLAMA_3_3_70B_Q2] {
+            assert!(is_pom_model(&m.model_id), "{} should be a PoM model", m.name);
+        }
+        assert!(!is_pom_model(&TINYLLAMA.model_id));
+    }
+
+    #[test]
+    fn new_h2_anchors_resolve_with_expected_chunk_counts() {
+        let q = pinned_pom_anchor(&QWEN3_1_7B.model_id).expect("Qwen3-1.7B anchor present");
+        assert_eq!(q.chunks, 34_420_544);
+        let l = pinned_pom_anchor(&LLAMA_3_3_70B_Q2.model_id).expect("Llama-70B-Q2 anchor present");
+        assert_eq!(l.chunks, 856_040_456);
+    }
+
+    #[test]
+    fn specs_for_swaps_at_h2_boundary() {
+        // Very-light: Gemma fallback before its own H2, Qwen3-1.7B at/after.
+        assert_eq!(specs_for(PRE_H2, Tier::VeryLight)[0].model_id, GEMMA_3_4B.model_id);
+        assert_eq!(specs_for(AT_H2, Tier::VeryLight)[0].model_id, QWEN3_1_7B.model_id);
+        // Very-high: Q4 before H2, Q2_K_L at/after.
+        assert_eq!(specs_for(PRE_H2, Tier::VeryHigh)[0].model_id, LLAMA_3_3_70B.model_id);
+        assert_eq!(specs_for(AT_H2, Tier::VeryHigh)[0].model_id, LLAMA_3_3_70B_Q2.model_id);
+        // Light/default/high are unchanged across H2 (same model, only the tier INDEX shifts).
+        assert_eq!(specs_for(PRE_H2, Tier::High)[0].model_id, specs_for(AT_H2, Tier::High)[0].model_id);
+    }
 }

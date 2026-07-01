@@ -15,6 +15,11 @@ use candle_core::Device;
 use keryx_vulkan::pom_walk::PomWalkGpu;
 use log::info;
 
+/// Lowercase hex of a 32-byte digest, for diagnostics.
+fn hex32(b: &[u8; 32]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
 /// The resident GPU PoM miner. `Option` so it can be dropped to free VRAM (inference has priority).
 static MINER: Mutex<Option<PomWalkGpu>> = Mutex::new(None);
 
@@ -80,6 +85,18 @@ pub fn ensure_installed(daa: u64) -> bool {
     ok
 }
 
+
+/// PoM tier index of the mining model at a given block DAA. Recomputed per block (not frozen at
+/// index-build time) so the tier reindexing at the very-light hardfork (H2) is applied at the
+/// exact boundary — e.g. Gemma 0→1 — rather than from a stale build-time value. The proof's `tier`
+/// field MUST come from here, keyed on the block's own DAA, or a post-H2 block carries the stale
+/// 4-tier index and the node rejects it (`BadWeightPath`).
+pub fn current_tier(daa: u64) -> Option<u8> {
+    let (model_id, _) = MINING_TIER.get()?;
+    crate::models::pom_tier_index(model_id, daa)
+}
+
+
 fn ensure_installed_inner(daa: u64) -> bool {
     let (model_id, gguf) = match MINING_TIER.get() {
         Some(x) => x,
@@ -91,15 +108,59 @@ fn ensure_installed_inner(daa: u64) -> bool {
     // REAL current DAA (not a fixed 0) so it lands on the node's active tier scheme (pre- or
     // post-H2) — see the `daa` doc comment above.
     if crate::pom::active_index().is_none() {
+        // Build-time tier is used only for logging + the get_or_build_index/set_index bookkeeping;
+        // the tier EMITTED in each proof is recomputed per block via `current_tier(daa)`. `daa` here
+        // is the block DAA at first activation (>= POM_ACTIVATION_DAA, guaranteed by the caller).
         let tier = match crate::models::pom_tier_index(model_id, daa) {
             Some(t) => t,
             None => return false,
         };
+
+        // Defer the heavy index build until the mining-tier GGUF is fully downloaded. The `.ok`
+        // sentinel sits next to model.gguf (written by slm after a verified download). Building from
+        // a partial GGUF fails with a confusing partial-read/ENOENT; returning false here just lets
+        // the mining loop retry on its next tick once the download lands. Checked via the GGUF's own
+        // directory rather than slm's SUPPORTED_SPECS, which holds the legacy (v1) lineup until the
+        // post-fork swap and would not list this v2 mining model.
+        let model_ready = std::path::Path::new(gguf)
+            .parent()
+            .map(|d| d.join(".ok").exists())
+            .unwrap_or(false);
+        if !model_ready {
+            info!("PoM: mining-tier model not fully downloaded yet (.ok absent) — deferring index build.");
+            return false;
+        }
+
         // Serialize the one-time host index build across PoM workers. Harmless for a single worker,
-        // but required once >1 worker exists: build_from_gguf writes a per-process Merkle tree, so
-        // concurrent builds would clobber the same file. get_or_build_index makes exactly one build.
+        // but required once >1 worker exists: get_or_build_index makes exactly one build. The closure
+        // also enforces the consensus-pinned (R_T, N) for this tier — a wrong-quant / corrupt /
+        // truncated GGUF is rejected HERE, once, instead of silently producing PoM blocks every one
+        // of which the node rejects with BadWeightPath.
         let gguf_path = gguf.clone();
-        if !crate::pom::get_or_build_index(tier, || crate::pom::WeightIndex::build_from_gguf(&gguf_path)) {
+        let expected = crate::models::pinned_pom_anchor(model_id);
+        if !crate::pom::get_or_build_index(tier, move || {
+            let idx = crate::pom::WeightIndex::build_from_gguf(&gguf_path)?;
+            if let Some(anchor) = expected {
+                if idx.n_chunks != anchor.chunks {
+                    return Err(candle_core::Error::Msg(format!(
+                        "PoM: index chunk count {} != consensus-pinned {} — wrong/corrupt GGUF for this tier; \
+                         refusing to mine (every block would be rejected)",
+                        idx.n_chunks, anchor.chunks
+                    )));
+                }
+                if idx.r_t != anchor.root {
+                    return Err(candle_core::Error::Msg(format!(
+                        "PoM: computed R_T {} != consensus-pinned root for this tier — wrong/corrupt GGUF; \
+                         refusing to mine (every block would be rejected)",
+                        hex32(&idx.r_t)
+                    )));
+                }
+                info!("PoM: index R_T + N match the consensus-pinned anchor for tier {}.", tier);
+            } else {
+                log::warn!("PoM: no consensus-pinned anchor for this model_id — skipping the R_T/N check.");
+            }
+            Ok(idx)
+        }) {
             return false;
         }
     }

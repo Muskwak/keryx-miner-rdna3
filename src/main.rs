@@ -54,6 +54,41 @@ fn adjust_console() -> Result<(), Error> {
     Ok(())
 }
 
+/// Install a SIGINT/SIGTERM (Ctrl-C on Windows) handler so the miner shuts down cleanly when a
+/// supervisor (HiveOS / systemd / start-miner.bat) stops it, instead of only dying on SIGKILL. The
+/// process holds long GPU dispatches and a resident PoM weight blob; a prompt `exit(0)` lets the OS
+/// reclaim the Vulkan context and returns success so supervisors don't record a crash. `exit` skips
+/// `WeightIndex::drop` (the pom-tree cleanup), but `build_from_gguf` already sweeps every stale
+/// `pom-tree-*.bin` on the next start, so a skipped Drop does not permanently leak a tree.
+fn spawn_shutdown_handler() {
+    tokio::spawn(async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("Could not install SIGTERM handler: {} — only SIGKILL will stop the miner.", e);
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => info!("Received SIGINT (Ctrl-C) — shutting down."),
+                _ = term.recv() => info!("Received SIGTERM — shutting down."),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if tokio::signal::ctrl_c().await.is_err() {
+                log::warn!("Could not listen for the Ctrl-C shutdown signal.");
+                return;
+            }
+            info!("Received Ctrl-C — shutting down.");
+        }
+        std::process::exit(0);
+    });
+}
+
 fn filter_plugins(dirname: &str) -> Vec<String> {
     match fs::read_dir(dirname) {
         Ok(readdir) => readdir
@@ -248,6 +283,9 @@ async fn main() -> Result<(), Error> {
         opt.num_threads = Some(0);
     }
     env_logger::builder().filter_level(opt.log_level()).parse_default_env().init();
+    // Shut down cleanly on SIGINT/SIGTERM (Ctrl-C on Windows) — supervisors stop the miner with
+    // SIGTERM, which previously had no handler and required SIGKILL.
+    spawn_shutdown_handler();
     info!("=================================================================================");
     info!("                 Keryx-Miner GPU {}", env!("CARGO_PKG_VERSION"));
     info!(" Mining for: {}", opt.mining_address.as_deref().unwrap_or("(recovery mode)"));
@@ -341,10 +379,11 @@ async fn main() -> Result<(), Error> {
     // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
     // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
     // property, not a per-GPU one.
+    //   --very-light → Qwen3-1.7B   (PoM tier 0, post-H2)
     //   (no flag)    → Dolphin-8B   [default]
     //   --light      → Gemma-3-4B
     //   --high       → Qwen3-32B
-    //   --very-high  → Llama-3.3-70B
+    //   --very-high  → Llama-3.3-70B (Q4 pre-H2 → Q2_K_L post-H2)
 
     // Warn if GPU 0's VRAM is too small for the selected model tier (Vulkan-queried).
     check_gpu_vram_for_tier(opt.high || opt.very_high, opt.very_high);
@@ -358,16 +397,25 @@ async fn main() -> Result<(), Error> {
     } else if opt.light {
         info!("--light mode: baseline tier — mines Gemma-3-4B under PoM.");
         keryx_miner::models::Tier::Light
+    } else if opt.very_light {
+        info!("--very-light mode: entry tier — mines Qwen3-1.7B under PoM (post-H2; falls back to Gemma-3-4B before H2).");
+        keryx_miner::models::Tier::VeryLight
     } else {
         info!("default mode: mines Dolphin-8B under PoM.");
         keryx_miner::models::Tier::Default
     };
-    // OPoI-v2 is in the PAST on mainnet (chain DAA is well beyond OPOI_V2_ACTIVATION_DAA), so the
-    // legacy (pre-fork) lineup is dead — nobody serves it and it must not be downloaded. Stage ONLY
-    // the uncensored lineup (`specs_for(OPOI_V2_ACTIVATION_DAA, ..)` = the currently-served models),
-    // filtered by what this hardware can serve (layer-A capability gate).
+    // OPoI v2 hardfork: the model lineup is DAA-gated (mirrors the node's
+    // opoi_v2_activation). Stage BOTH lineups for this tier — each filtered by what
+    // this hardware can serve (layer-A capability gate) — so the chain crossing
+    // hot-swaps without a restart:
+    //   - legacy (daa < H) is prefetched now and mined immediately;
+    //   - uncensored (daa >= H) is prefetched in the background and swapped in at H.
+    // Stage the FINAL (post-H2) lineup directly — `specs_for(VERY_LIGHT_ACTIVATION_DAA, ..)` returns
+    // the latest model for the tier. For light/default/high this is identical to the OPoI-v2 model
+    // (unchanged at H2); for `--very-light` it stages Qwen3-1.7B and for `--very-high` the Q2_K_L.
+    // The chain relaunches directly into H2, so the post-H2 model is the one that must be resident.
     let specs_v2 = filter_specs_by_vram(
-        keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
+        keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, tier),
     );
     // PoM: pick the highest tier this miner serves that has a pinned R_T (the model it will
     // mine under possession). Captured before `specs_v2` is consumed; the index is built after
@@ -410,11 +458,12 @@ async fn main() -> Result<(), Error> {
     if let Some(spec) = pom_spec {
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         // Force the single-device split loader so the mining tier exposes its quant tensors for
-        // zero-dup sharing. The PoM tier index is computed per block from the block DAA (it shifts
-        // at the very-light H2 hardfork), so it is not recorded here — only the model.
+        // zero-dup sharing, and record the mining MODEL so the walk can be built on demand. The PoM
+        // tier INDEX is computed per block from the block DAA (`pom_gpu::current_tier`), not frozen
+        // here — it reindexes at H2, so a startup-frozen value would be wrong post-fork.
         keryx_miner::slm::set_pom_force_split(true);
         keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
-        info!("PoM: configured to mine {}; index + GPU walk load lazily when PoM activates (DAA {}).",
+        info!("PoM: configured to mine {} under possession; index + GPU walk load lazily when PoM activates (DAA {}).",
             spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
     }
 
