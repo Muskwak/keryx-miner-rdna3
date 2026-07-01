@@ -17,6 +17,17 @@ use keryx_miner::{PluginManager, WorkerSpec};
 
 type MinerHandler = std::thread::JoinHandle<Result<(), Error>>;
 
+/// Grace period a worker gets to observe `Close` and return on its own before the freeze
+/// handler force-kills it. It MUST exceed the worst-case *uninterruptible* op — a one-time GPU
+/// VRAM blob load, which is a synchronous Vulkan upload that can take tens of seconds for a large
+/// model and cannot poll `Close` mid-call. Too short and the watchdog kills a worker mid-load: on
+/// Windows `kernel32::TerminateThread` destroys the thread without letting std write its result, so
+/// the drop's `join()` then panics ("threads should not terminate unexpectedly") and crashes the
+/// whole process on every reconnect. In steady state a worker checks `Close` between mining batches
+/// and exits in well under a second, so this ceiling only ever applies mid-load — it adds no delay
+/// to a normal reconnect. 60s covers any RDNA3-servable model's load with margin.
+const FREEZE_GRACE: Duration = Duration::from_secs(60);
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C" fn signal_panic(_signal: nix::libc::c_int) {
     panic!("Forced shutdown");
@@ -35,7 +46,7 @@ fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -
     use std::os::unix::thread::JoinHandleExt;
     let pthread_handle = handle.as_pthread_t();
     std::thread::spawn(move || {
-        sleep(Duration::from_millis(1000));
+        sleep(FREEZE_GRACE);
         if kill_switch.load(Ordering::SeqCst) {
             match nix::sys::pthread::pthread_kill(pthread_handle, nix::sys::signal::Signal::SIGUSR1) {
                 Ok(()) => {
@@ -65,7 +76,7 @@ fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -
 
     std::thread::spawn(move || unsafe {
         let ensure_full_move = raw_handle;
-        sleep(Duration::from_millis(1000));
+        sleep(FREEZE_GRACE);
         if kill_switch.load(Ordering::SeqCst) {
             kernel32::TerminateThread(ensure_full_move.0, 0);
         }
