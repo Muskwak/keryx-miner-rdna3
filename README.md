@@ -121,7 +121,6 @@ PoW workers if you want them.
 | `KERYX_LLAMA_SERVER` | full path to the `llama-server` (Vulkan) binary |
 | `KERYX_VULKAN_WORKLOAD` | nonces per PoW dispatch (default `1048576`) |
 | `KERYX_POW_ONLY` | `1` = mine kHeavyHash shares only; skip OPoI models + `llama-server` (no PoM) |
-| `KERYX_SKIP_LEGACY_MODELS` | `1` = don't download the pre-fork lineup; only the post-fork (PoM) model is fetched |
 | `KERYX_POM_KEEP_RESIDENT` | `1` = keep the PoM weight blob resident across inference when VRAM fits (skips reload) |
 | `GLSLC` / `VULKAN_SDK` | (build only) locate `glslc` for shader compilation |
 
