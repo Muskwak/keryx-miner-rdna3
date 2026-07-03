@@ -17,7 +17,7 @@ inference (OPoI — Optimistic Proof of Inference).
 |---|---|---|
 | **PoW** (kHeavyHash) | Vulkan compute shader | `keccak-f1600 → 64×64 matmul → wave_mix → keccak`. Bit-exact vs the host reference, verified on a 7900 XT. |
 | **PoM** (possession walk) | Vulkan compute shader | walk over the model weights resident in **device-local VRAM**, sharded across ≤1 GiB buffers reached by buffer-device-address (an 8B+ model's blob exceeds AMD's 4 GiB SSBO range and 2 GiB single-allocation limits). Bit-exact vs `pom::walk_final`, verified on a 7900 XT. |
-| **OPoI inference** (Dolphin-8B / Qwen3-32B / Gemma / Llama) | prebuilt **llama.cpp Vulkan** `llama-server` | launched as a child process with all layers offloaded (`-ngl 999`); the miner talks to it over localhost HTTP. |
+| **OPoI inference** (Dolphin-8B / Qwen3-32B / Gemma / Llama) | **llama.cpp Vulkan, in-process** | linked into the miner (all layers on GPU); the PoM walk shares the engine's resident weight buffers (zero-dup) — no child process, no HTTP. |
 | **OPoI fraud-proof commitment** | CPU (integer) | `model_fixed::forward` — a deterministic, bit-exact 32-byte fold required by consensus. Not a GPU/LLM workload; unchanged. |
 
 The custom kernels live in the [`keryx-vulkan`](keryx-vulkan/) crate (uses [`ash`](https://crates.io/crates/ash);
@@ -37,7 +37,6 @@ real GPU (`cargo test -p keryx-vulkan`).
 **Run:**
 - An AMD RDNA3 GPU + recent driver (the Vulkan runtime loader `vulkan-1` ships with the AMD
   Adrenalin / Mesa RADV driver — no Vulkan SDK needed at runtime).
-- A **prebuilt llama.cpp `llama-server` (Vulkan build)** — see [Inference setup](#inference-setup).
 
 ---
 
@@ -56,18 +55,11 @@ SDKs are required.
 
 ## Inference setup
 
-OPoI inference is mandatory, and this fork serves it through `llama-server` (Vulkan). Download the
-prebuilt release for your OS from the
-[llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) — the **Vulkan** asset, e.g.
-`llama-b####-bin-win-vulkan-x64.zip` on Windows — and make `llama-server` discoverable in one of:
-
-1. `<miner_dir>/llama/llama-server[.exe]`  (next to the miner binary), **or**
-2. `<miner_dir>/llama-server[.exe]`, **or**
-3. on `PATH`, **or**
-4. point `KERYX_LLAMA_SERVER` at the full path.
-
-The miner launches it automatically with full GPU offload and serves the active model tier. The
-GGUF model files are downloaded on demand over IPFS on first run (same as upstream).
+Nothing to install: OPoI inference runs **in-process** (llama.cpp/Vulkan is linked into the
+miner, all layers on the GPU), and on the inference GPU the PoM walk reads the engine's own
+resident weight buffers (zero-dup) — mining a tier costs ~281 MB of extra VRAM on that card
+instead of a second full weight copy. The GGUF model files are downloaded on demand over IPFS
+on first run (same as upstream).
 
 ---
 
@@ -98,22 +90,21 @@ PoW workers if you want them.
 By default the miner spawns **one PoW/PoM worker per discrete Vulkan GPU** (the startup log prints
 the enumerated device list); restrict with `--gpu 0,2` (raw Vulkan device indices). Every mining
 GPU keeps its own resident copy of the same tier's weight blob, streamed straight from the GGUF on
-disk (no full-model host RAM copy — peak host overhead is a 256 MiB staging window). Inference
-(`llama-server`) is pinned to the first discrete GPU via `GGML_VK_VISIBLE_DEVICES` (override with
-`KERYX_INFER_GPU=N`); only the worker sharing that GPU pauses during OPoI challenges — the other
-cards keep mining.
+disk (no full-model host RAM copy — peak host overhead is a 256 MiB staging window). Inference is
+pinned to the first discrete GPU via `GGML_VK_VISIBLE_DEVICES` (override with `KERYX_INFER_GPU=N`),
+where the walk shares its weights (zero-dup); only the worker sharing that GPU pauses during OPoI
+challenges — the other cards keep mining with their own streamed weight blobs.
 
-### In-process inference (experimental, `--features inproc-llm`)
+### Building from source
 
-By default OPoI inference runs in the external prebuilt `llama-server` (zero-toolchain).
-Building with `--features inproc-llm` links llama.cpp (Vulkan) into the miner via
-[`llama-cpp-2`] instead — same models, same greedy decoding through the GGUF's chat
-template, no child process — and is the groundwork for sharing one VRAM weight copy
-between inference and the PoM walk (zero-dup). It adds a C++ build to the otherwise
-zero-toolchain compile: CMake + Ninja, LLVM (`libclang` for bindgen, set `LIBCLANG_PATH`),
-and the Vulkan SDK (`glslc`). On a GNU-toolchain (MinGW) host also set
+The miner links llama.cpp (Vulkan) in-process via [`llama-cpp-2`], so building needs a C++
+toolchain besides Rust: CMake + Ninja, LLVM (`libclang` for bindgen — set `LIBCLANG_PATH` if
+not auto-detected), and the Vulkan SDK (`glslc` + headers; set `VULKAN_SDK`). On a GNU-toolchain
+(MinGW) Windows host also set
 `BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-w64-mingw32 -I<mingw>/x86_64-w64-mingw32/include -I<llvm>/lib/clang/<ver>/include"`
-and keep MinGW's `bin` on `PATH` at runtime (`libstdc++-6.dll`).
+and keep MinGW's `bin` on `PATH` at runtime (`libstdc++-6.dll`). `.cargo/config.toml` carries
+machine-specific `[env]` defaults — adjust them for your box. Prebuilt release binaries need
+none of this.
 
 [`llama-cpp-2`]: https://github.com/utilityai/llama-cpp-rs
 
@@ -142,11 +133,10 @@ and keep MinGW's `bin` on `PATH` at runtime (`libstdc++-6.dll`).
 
 | Var | Meaning |
 |-----|---------|
-| `KERYX_LLAMA_SERVER` | full path to the `llama-server` (Vulkan) binary |
 | `KERYX_VULKAN_WORKLOAD` | nonces per PoW dispatch (default `1048576`) |
-| `KERYX_POW_ONLY` | `1` = mine kHeavyHash shares only; skip OPoI models + `llama-server` (no PoM) |
+| `KERYX_POW_ONLY` | `1` = mine kHeavyHash shares only; skip OPoI models + inference (no PoM) |
 | `KERYX_POM_KEEP_RESIDENT` | `1` = keep the PoM weight blob resident across inference when VRAM fits (skips reload) |
-| `KERYX_INFER_GPU` | raw Vulkan device index inference (llama-server) is pinned to on multi-GPU rigs (default: first discrete GPU) |
+| `KERYX_INFER_GPU` | raw Vulkan device index inference is pinned to on multi-GPU rigs (default: first discrete GPU) |
 | `GLSLC` / `VULKAN_SDK` | (build only) locate `glslc` for shader compilation |
 
 ---

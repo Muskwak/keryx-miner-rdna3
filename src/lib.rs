@@ -3,8 +3,6 @@ use std::any::Any;
 use std::error::Error as StdError;
 
 pub mod inference;
-pub mod llama_server;
-#[cfg(feature = "inproc-llm")]
 pub mod llm_engine;
 pub mod models;
 pub mod pom;

@@ -1,0 +1,9 @@
+# Local build environment for the in-process llama.cpp (zero-dup) engine — the default and
+# only inference backend. These are MACHINE-SPECIFIC defaults for the primary dev box
+# (windows-gnu + scoop toolchain); cargo's [env] only applies a value when the variable is
+# not already set, so CI (which sets these per-step) and custom shells are unaffected.
+# Adjust paths for your machine, or export the variables yourself.
+[env]
+LIBCLANG_PATH = "C:/Users/SHERZOD-INTEL/scoop/apps/llvm/current/bin"
+BINDGEN_EXTRA_CLANG_ARGS = "--target=x86_64-w64-mingw32 -IC:/Users/SHERZOD-INTEL/scoop/apps/mingw/15.2.0-rt_v13-rev1/x86_64-w64-mingw32/include -IC:/Users/SHERZOD-INTEL/scoop/apps/llvm/current/lib/clang/22/include"
+CMAKE_GENERATOR = "Ninja"

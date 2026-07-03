@@ -5,10 +5,12 @@ on: [push, pull_request]
 env:
   CARGO_TERM_COLOR: always
 
-# RDNA3 / Vulkan fork: no CUDA/nvcc, no OpenCL. The build needs `protoc` and a recent `glslc`
-# (keryx-vulkan/build.rs compiles the GLSL compute shaders to SPIR-V at build time). The GPU
-# bit-exactness tests in keryx-vulkan skip gracefully when no Vulkan device is present (CI runners
-# have no GPU), so the suite still validates compilation + the CPU paths.
+# RDNA3 / Vulkan fork: no CUDA/nvcc, no OpenCL. Every build compiles llama.cpp (Vulkan)
+# in-process — the miner's only inference engine, whose resident weights the PoM walk shares
+# (zero-dup) — so CI needs protoc, glslc + Vulkan SDK (headers + SPIRV-Headers cmake config),
+# cmake, and libclang (bindgen) on every job. The GPU bit-exactness tests skip gracefully when
+# no Vulkan device is present (CI runners have no GPU), so the suite still validates
+# compilation + the CPU paths.
 
 jobs:
   check:
@@ -16,34 +18,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
       - name: Install Protoc
         uses: rustfs/setup-protoc@v3.0.1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Vulkan SDK (glslc)
+      - name: Install Vulkan SDK
         uses: ./.github/actions/vulkan-sdk
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo check
         run: cargo check --workspace --tests
 
-  test:
-    name: Test Suite
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+  test-linux:
+    name: Test Suite (linux)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Fix CRLF on Windows
-        if: runner.os == 'Windows'
-        run: git config --global core.autocrlf false
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Vulkan SDK (glslc)
+      - name: Install Vulkan SDK
         uses: ./.github/actions/vulkan-sdk
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -54,16 +53,53 @@ jobs:
       - name: cargo test (no default features)
         run: cargo test -p keryx-miner --release --no-default-features
 
+  test-windows:
+    name: Test Suite (windows)
+    runs-on: windows-latest
+    env:
+      # llama.cpp submodule paths exceed MAX_PATH: git-CLI fetch honours core.longpaths, and
+      # the short target dir keeps ggml's nested cmake TryCompile paths under the limit.
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_TARGET_DIR: D:\ct
+      # bindgen needs libclang; LLVM is preinstalled on windows runners.
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      # The VS generator's vulkan-shaders-gen ExternalProject rule breaks (MSB8066); Ninja works.
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - name: Fix CRLF + long paths
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+      - uses: actions/checkout@v7
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Vulkan SDK
+        uses: ./.github/actions/vulkan-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # cl.exe on PATH for the Ninja generator. Steps below run in pwsh (the default), where
+      # Git's coreutils link.exe does NOT shadow MSVC's linker.
+      - name: MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: cargo test (workspace, release)
+        run: cargo test --workspace --release
+      - name: cargo test (no-asm)
+        run: cargo test -p keryx-miner --release --features no-asm
+
   lints:
     name: Lints
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
       - name: Install Protoc
         uses: rustfs/setup-protoc@v3.0.1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Vulkan SDK (glslc)
+      - name: Install Vulkan SDK
         uses: ./.github/actions/vulkan-sdk
       - uses: dtolnay/rust-toolchain@stable
         with:

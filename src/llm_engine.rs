@@ -1,12 +1,11 @@
 //! Phase-1 in-process OPoI inference — llama.cpp via FFI (`llama-cpp-2`, **Vulkan** backend).
 //!
-//! Drop-in replacement for the external `llama-server` child process (`llama_server.rs`):
+//! The miner's ONLY inference engine (the external llama-server child process is gone):
 //! same GGUF models, same ggml Vulkan backend, same greedy (temperature-0) decoding through
 //! the model's own chat template — but linked into the miner, so there is no HTTP hop, no
 //! child-process lifecycle, and (Phase 2) the PoM walk can eventually read inference's own
 //! resident weight buffers instead of keeping a second VRAM copy.
 //!
-//! Compiled only with `--features inproc-llm`; `slm.rs` selects the engine at compile time.
 
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -150,7 +149,6 @@ impl LlamaEngine {
 }
 
 /// Where a weight tensor's bytes live, as seen by the shared PoM walk.
-#[cfg(feature = "zero-dup")]
 pub enum TensorLoc {
     /// VK-resident in ggml's buffers: walked in place — zero duplication.
     Vk(u64),
@@ -160,14 +158,12 @@ pub enum TensorLoc {
 }
 
 /// One weight tensor of the resident model as seen by the shared PoM walk.
-#[cfg(feature = "zero-dup")]
 pub struct SharedTensor {
     pub name: String,
     pub size: u64,
     pub loc: TensorLoc,
 }
 
-#[cfg(feature = "zero-dup")]
 impl LlamaEngine {
     /// Table of the resident model's weight tensors (load order — the caller sorts into the
     /// canonical name order). VK-resident tensors carry their GPU address; tensors llama.cpp

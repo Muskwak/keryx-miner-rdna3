@@ -9,18 +9,14 @@ on:
 permissions:
   contents: write
 
-# RDNA3 / Vulkan fork: self-contained binaries (no CUDA/OpenCL plugin .so/.dll), two variants
-# per OS:
-#   * standard  — external prebuilt llama-server for OPoI inference (zero C++ toolchain to build)
-#   * zero-dup  — in-process llama.cpp (Vulkan): the PoM walk shares the inference engine's
-#                 resident weight buffers (single binary, no llama-server; needs cmake + ninja +
-#                 libclang + Vulkan SDK at build time)
+# RDNA3 / Vulkan fork: ONE self-contained binary per OS — llama.cpp (Vulkan) runs in-process
+# and the PoM walk shares the inference engine's resident weight buffers (zero-dup). Building
+# needs cmake + ninja + libclang (bindgen) + the Vulkan SDK.
 #
 # The Linux jobs run inside an ubuntu:22.04 container: current HiveOS worker images are Ubuntu
 # 22.04 based (glibc 2.35) — and RDNA3 cards need the recent kernel/Mesa those images carry, so
 # older Hive images can't run this fork anyway. Building on newer runners than 22.04 would still
-# break rigs with "GLIBC_2.3x not found". The HiveOS package ships the zero-dup binary — one
-# process, no llama-server child.
+# break rigs with "GLIBC_2.3x not found".
 
 jobs:
   build-windows:
@@ -54,16 +50,6 @@ jobs:
         shell: bash
         run: echo "TAG=${{ github.event.release.tag_name || format('dev-{0}', github.sha) }}" >> "$GITHUB_ENV"
 
-      - name: Build standard (llama-server variant)
-        shell: bash
-        run: |
-          cargo build --release --bin keryx-miner
-          asset="keryx-miner-${TAG}-win64-amd64"
-          mkdir "$asset"
-          cp "$CARGO_TARGET_DIR"/release/keryx-miner.exe "$asset/"
-          cp start-miner.bat README.md "$asset/" 2>/dev/null || true
-          7z a -tzip "$asset.zip" "$asset"
-
       # cl.exe on PATH for the Ninja generator: the VS generator's vulkan-shaders-gen
       # ExternalProject rule breaks (MSB8066); Ninja matches the locally-validated path.
       - name: MSVC dev environment
@@ -71,16 +57,16 @@ jobs:
 
       # pwsh, not bash: under bash, Git's coreutils link.exe shadows MSVC's linker in the
       # vcvars environment and rustc fails with "link.exe returned an unexpected error".
-      - name: Build zero-dup (in-process llama.cpp variant)
+      - name: Build
         shell: pwsh
         env:
           # bindgen needs libclang; LLVM is preinstalled on windows runners.
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
           CMAKE_GENERATOR: Ninja
         run: |
-          cargo build --release --features zero-dup --bin keryx-miner
+          cargo build --release --bin keryx-miner
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          $asset = "keryx-miner-$env:TAG-win64-amd64-zerodup"
+          $asset = "keryx-miner-$env:TAG-win64-amd64"
           New-Item -ItemType Directory $asset | Out-Null
           Copy-Item "$env:CARGO_TARGET_DIR/release/keryx-miner.exe" $asset/
           foreach ($f in @('start-miner.bat', 'README.md')) { if (Test-Path $f) { Copy-Item $f $asset/ } }
@@ -149,26 +135,15 @@ jobs:
       - name: Resolve tag
         run: echo "TAG=${{ github.event.release.tag_name || format('dev-{0}', github.sha) }}" >> "$GITHUB_ENV"
 
-      - name: Build standard (llama-server variant)
-        run: |
-          set -euxo pipefail
-          cargo build --release --bin keryx-miner
-          asset="keryx-miner-${TAG}-linux-amd64"
-          mkdir "$asset"
-          cp target/release/keryx-miner "$asset/"
-          cp README.md "$asset/" 2>/dev/null || true
-          strip "$asset/keryx-miner" || true
-          tar czvf "$asset.tgz" "$asset"
-
-      - name: Build zero-dup (in-process llama.cpp variant)
+      - name: Build
         env:
           # jammy's libclang-dev is clang-14; point bindgen at it explicitly.
           LIBCLANG_PATH: /usr/lib/llvm-14/lib
           CMAKE_GENERATOR: Ninja
         run: |
           set -euxo pipefail
-          cargo build --release --features zero-dup --bin keryx-miner
-          asset="keryx-miner-${TAG}-linux-amd64-zerodup"
+          cargo build --release --bin keryx-miner
+          asset="keryx-miner-${TAG}-linux-amd64"
           mkdir "$asset"
           cp target/release/keryx-miner "$asset/"
           cp README.md "$asset/" 2>/dev/null || true

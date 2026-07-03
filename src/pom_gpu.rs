@@ -33,7 +33,6 @@ fn hex32(b: &[u8; 32]) -> String {
 #[derive(Clone)]
 enum Resident {
     Blob(Arc<PomWalkGpu>),
-    #[cfg(feature = "zero-dup")]
     Shared { walk: Arc<keryx_vulkan::pom_walk::PomWalkShared>, _engine: Arc<crate::llm_engine::LlamaEngine> },
 }
 
@@ -41,8 +40,7 @@ impl Resident {
     fn mine(&self, pph: &[u8; 32], ts: u64, target: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
         match self {
             Resident::Blob(m) => m.mine(pph, ts, target, start, batch),
-            #[cfg(feature = "zero-dup")]
-            Resident::Shared { walk, .. } => walk.mine(pph, ts, target, start, batch),
+                    Resident::Shared { walk, .. } => walk.mine(pph, ts, target, start, batch),
         }
     }
 
@@ -51,8 +49,7 @@ impl Resident {
     fn extra_vram_bytes(&self) -> u64 {
         match self {
             Resident::Blob(m) => m.n_chunks() * 32,
-            #[cfg(feature = "zero-dup")]
-            Resident::Shared { .. } => 0,
+                    Resident::Shared { .. } => 0,
         }
     }
 }
@@ -224,7 +221,6 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
     // Zero-dup: on the inference GPU, walk the in-process engine's own resident weight
     // buffers — 0 extra VRAM — instead of installing a second copy. Any failure falls back
     // to the streamed blob below (correct, just costs the duplicate VRAM).
-    #[cfg(feature = "zero-dup")]
     if device == keryx_vulkan::inference_device_index() as u32 {
         match install_shared(idx, model_id) {
             Ok(entry) => {
@@ -272,7 +268,6 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
 /// canonical name-sorted order, hard N equality, plus a random chunk sample fetched through the
 /// GPU table and compared byte-for-byte against the GGUF-backed index — a mismatch would mean
 /// every mined block gets rejected, so it aborts the shared path entirely.
-#[cfg(feature = "zero-dup")]
 fn install_shared(idx: &'static crate::pom::WeightIndex, model_id: &[u8; 32]) -> Result<Resident, String> {
     // The engine must be serving the MINING model (post-PoM: serving == mining tier). This
     // loads it resident on the inference GPU if it is not already.

@@ -3,8 +3,7 @@
 //! miner-owned streamed-blob walk — same chunks, same winners — before it is trusted to mine.
 //!
 //! Ignored by default (loads a multi-GB model + a full weight blob on the GPU; ~11 GB VRAM):
-//!   KERYX_TEST_GGUF=<path to model.gguf> cargo test --release --features zero-dup --test zero_dup -- --ignored --nocapture
-#![cfg(feature = "zero-dup")]
+//!   KERYX_TEST_GGUF=<path to model.gguf> cargo test --release --test zero_dup -- --ignored --nocapture
 
 use keryx_miner::llm_engine::LlamaEngine;
 use keryx_miner::pom::WeightIndex;

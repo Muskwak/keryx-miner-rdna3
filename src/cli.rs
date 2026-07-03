@@ -117,7 +117,7 @@ pub struct Opt {
         help = "Comma-separated Vulkan device indices to mine on, e.g. --gpu 0,2 [default: all discrete GPUs]",
         long_help = "Comma-separated raw Vulkan device indices to mine on (the startup log prints the \
                      enumerated device list). Default: every discrete GPU. On multi-GPU rigs inference \
-                     (llama-server) is pinned to the first discrete GPU — override with KERYX_INFER_GPU."
+                     is pinned to the first discrete GPU — override with KERYX_INFER_GPU."
     )]
     pub gpu: Option<String>,
 
