@@ -102,9 +102,9 @@ toolchain besides Rust: CMake + Ninja, LLVM (`libclang` for bindgen — set `LIB
 not auto-detected), and the Vulkan SDK (`glslc` + headers; set `VULKAN_SDK`). On a GNU-toolchain
 (MinGW) Windows host also set
 `BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-w64-mingw32 -I<mingw>/x86_64-w64-mingw32/include -I<llvm>/lib/clang/<ver>/include"`
-and keep MinGW's `bin` on `PATH` at runtime (`libstdc++-6.dll`). `.cargo/config.toml` carries
-machine-specific `[env]` defaults — adjust them for your box. Prebuilt release binaries need
-none of this.
+and keep MinGW's `bin` on `PATH` at runtime (`libstdc++-6.dll`). Tip: put your machine's values
+in a git-ignored `.cargo/config.toml` `[env]` section so plain `cargo build` works without
+exporting anything. Prebuilt release binaries need none of this.
 
 [`llama-cpp-2`]: https://github.com/utilityai/llama-cpp-rs
 
