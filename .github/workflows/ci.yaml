@@ -18,8 +18,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install libclang
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - name: Install libclang + Vulkan loader
+        # libvulkan-dev: the SDK tarball ships headers but no prebuilt libvulkan.so, and
+        # ggml's find_package(Vulkan) needs Vulkan_LIBRARY to link against.
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libvulkan-dev
       - name: Install Protoc
         uses: rustfs/setup-protoc@v3.0.1
         with:
@@ -36,8 +38,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install libclang
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - name: Install libclang + Vulkan loader
+        # libvulkan-dev: the SDK tarball ships headers but no prebuilt libvulkan.so, and
+        # ggml's find_package(Vulkan) needs Vulkan_LIBRARY to link against.
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libvulkan-dev
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -93,8 +97,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install libclang
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - name: Install libclang + Vulkan loader
+        # libvulkan-dev: the SDK tarball ships headers but no prebuilt libvulkan.so, and
+        # ggml's find_package(Vulkan) needs Vulkan_LIBRARY to link against.
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libvulkan-dev
       - name: Install Protoc
         uses: rustfs/setup-protoc@v3.0.1
         with:
