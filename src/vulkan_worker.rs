@@ -50,6 +50,24 @@ impl Plugin for VulkanPlugin {
         true
     }
     fn get_worker_specs(&self) -> Vec<Box<dyn WorkerSpec>> {
+        // Device table is logged HERE, not in process_option: options are processed before
+        // main initialises the logger, so anything logged there is silently dropped. This
+        // runs at worker launch, and multi-GPU users need the index table to use --gpu.
+        for d in keryx_vulkan::enumerate_devices() {
+            info!(
+                "Vulkan device {}: {} ({} MiB VRAM{})",
+                d.index,
+                d.name,
+                d.vram_mb,
+                if d.discrete { ", discrete" } else { "" }
+            );
+        }
+        info!(
+            "Vulkan PoW: {} worker(s) on device(s) {:?} (workload {} nonces/dispatch)",
+            self.devices.len(),
+            self.devices,
+            self.workload
+        );
         self.devices
             .iter()
             .map(|&device_index| {
@@ -59,15 +77,6 @@ impl Plugin for VulkanPlugin {
     }
     fn process_option(&mut self, matches: &ArgMatches) -> Result<usize, Error> {
         let all = keryx_vulkan::enumerate_devices();
-        for d in &all {
-            info!(
-                "Vulkan device {}: {} ({} MiB VRAM{})",
-                d.index,
-                d.name,
-                d.vram_mb,
-                if d.discrete { ", discrete" } else { "" }
-            );
-        }
 
         self.devices = match matches.value_of("gpu") {
             // Explicit selection: comma-separated raw device indices.
@@ -100,12 +109,6 @@ impl Plugin for VulkanPlugin {
             }
         };
 
-        info!(
-            "Vulkan PoW: {} worker(s) on device(s) {:?} (workload {} nonces/dispatch)",
-            self.devices.len(),
-            self.devices,
-            self.workload
-        );
         Ok(self.devices.len())
     }
 }
