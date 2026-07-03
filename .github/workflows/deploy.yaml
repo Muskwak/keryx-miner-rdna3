@@ -3,27 +3,32 @@ name: Build and upload assets
 on:
   release:
     types: [published]
+  # Dry-run without a release: builds everything and uploads workflow artifacts only.
+  workflow_dispatch:
 
 permissions:
   contents: write
 
-# RDNA3 / Vulkan fork: single self-contained binary (no CUDA/OpenCL plugin .so/.dll). Linux + Windows
-# only — the fork targets AMD RDNA3 via Vulkan. Build needs `protoc` + a recent `glslc`.
+# RDNA3 / Vulkan fork: self-contained binaries (no CUDA/OpenCL plugin .so/.dll), two variants
+# per OS:
+#   * standard  — external prebuilt llama-server for OPoI inference (zero C++ toolchain to build)
+#   * zero-dup  — in-process llama.cpp (Vulkan): the PoM walk shares the inference engine's
+#                 resident weight buffers (single binary, no llama-server; needs cmake + ninja +
+#                 libclang + Vulkan SDK at build time)
+#
+# The Linux jobs run inside an ubuntu:20.04 container: HiveOS worker images are Ubuntu 20.04
+# based (glibc 2.31), so anything built on newer runners would fail with "GLIBC_2.3x not found"
+# on the rigs. The HiveOS package ships the zero-dup binary — one process, no llama-server child.
 
 jobs:
-  build:
-    name: Build ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+  build-windows:
+    name: Build windows
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-
       - name: Fix CRLF on Windows
-        if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
 
       - name: Install Protoc
         uses: rustfs/setup-protoc@v3.0.1
@@ -35,27 +40,122 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
+      - name: Resolve tag
+        shell: bash
+        run: echo "TAG=${{ github.event.release.tag_name || format('dev-{0}', github.sha) }}" >> "$GITHUB_ENV"
+
+      - name: Build standard (llama-server variant)
+        shell: bash
         run: |
           cargo build --release --bin keryx-miner
-          asset="keryx-miner-${{ github.event.release.tag_name }}-linux-amd64"
+          asset="keryx-miner-${TAG}-win64-amd64"
           mkdir "$asset"
-          cp target/release/keryx-miner "$asset/keryx-miner"
+          cp target/release/keryx-miner.exe "$asset/"
+          cp start-miner.bat README.md "$asset/" 2>/dev/null || true
+          7z a -tzip "$asset.zip" "$asset"
+
+      - name: Build zero-dup (in-process llama.cpp variant)
+        shell: bash
+        env:
+          # bindgen needs libclang; LLVM is preinstalled on windows runners.
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: |
+          cargo build --release --features zero-dup --bin keryx-miner
+          asset="keryx-miner-${TAG}-win64-amd64-zerodup"
+          mkdir "$asset"
+          cp target/release/keryx-miner.exe "$asset/"
+          cp start-miner.bat README.md "$asset/" 2>/dev/null || true
+          7z a -tzip "$asset.zip" "$asset"
+
+      - name: Upload artifacts (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-assets
+          path: keryx-miner-*.zip
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: keryx-miner-*.zip
+
+  build-linux:
+    name: Build linux + hiveos
+    runs-on: ubuntu-latest
+    # glibc 2.31 floor — matches HiveOS 20.04-based worker images.
+    container: ubuntu:20.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install system toolchain
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl wget gnupg xz-utils git \
+            build-essential gcc-10 g++-10 ninja-build pkg-config \
+            clang-12 libclang-12-dev libvulkan-dev p7zip-full
+          # llama.cpp wants a newer cmake than focal's 3.16 — Kitware maintains a focal repo.
+          wget -qO- https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor -o /usr/share/keyrings/kitware.gpg
+          echo "deb [signed-by=/usr/share/keyrings/kitware.gpg] https://apt.kitware.com/ubuntu/ focal main" > /etc/apt/sources.list.d/kitware.list
+          apt-get update && apt-get install -y cmake
+          # glslc: the LunarG SDK tarball binaries are built on newer glibc and will not run in
+          # this container, so use LunarG's focal apt repo (its glslang is recent enough for
+          # GL_EXT_integer_dot_product / buffer_reference / int64 — everything our shaders use).
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | gpg --dearmor -o /usr/share/keyrings/lunarg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/lunarg.gpg] https://packages.lunarg.com/vulkan focal main" > /etc/apt/sources.list.d/lunarg.list
+          apt-get update && apt-get install -y vulkan-sdk || apt-get install -y shaderc glslang-tools
+          glslc --version
+
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: rustfs/setup-protoc@v3.0.1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve tag
+        run: echo "TAG=${{ github.event.release.tag_name || format('dev-{0}', github.sha) }}" >> "$GITHUB_ENV"
+
+      - name: Build standard (llama-server variant)
+        run: |
+          set -euxo pipefail
+          cargo build --release --bin keryx-miner
+          asset="keryx-miner-${TAG}-linux-amd64"
+          mkdir "$asset"
+          cp target/release/keryx-miner "$asset/"
           cp README.md "$asset/" 2>/dev/null || true
           strip "$asset/keryx-miner" || true
           tar czvf "$asset.tgz" "$asset"
-          echo "ASSET=$asset.tgz" >> "$GITHUB_ENV"
 
-      # HiveOS custom-miner package: the *-hiveos.tgz a flightsheet's "Installation URL"
-      # points at. Extracts to /hive/miners/custom/keryx-miner/ on the rig. Linux only.
-      - name: Package HiveOS flightsheet (Linux)
-        if: runner.os == 'Linux'
+      - name: Build zero-dup (in-process llama.cpp variant)
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-12/lib
+          CC: gcc-10
+          CXX: g++-10
+          CMAKE_GENERATOR: Ninja
         run: |
-          tag="${{ github.event.release.tag_name }}"
+          set -euxo pipefail
+          cargo build --release --features zero-dup --bin keryx-miner
+          asset="keryx-miner-${TAG}-linux-amd64-zerodup"
+          mkdir "$asset"
+          cp target/release/keryx-miner "$asset/"
+          cp README.md "$asset/" 2>/dev/null || true
+          strip "$asset/keryx-miner" || true
+          tar czvf "$asset.tgz" "$asset"
+
+      # HiveOS custom-miner package: the *-hiveos.tgz a flightsheet's "Installation URL" points
+      # at; extracts to /hive/miners/custom/keryx-miner/. Ships the ZERO-DUP binary: a single
+      # process (inference in-process, PoM walk over shared weights) — no llama-server child for
+      # h-run.sh to manage. Requires libvulkan1 + Vulkan-capable amdgpu on the rig (h-config.sh
+      # installs libvulkan1 if missing).
+      - name: Package HiveOS flightsheet
+        run: |
+          set -euxo pipefail
           pkg="keryx-miner"
-          # Regenerate the manifest so CUSTOM_VERSION tracks the release tag.
-          ( cd integrations/hiveos && bash createmanifest.sh "${tag#v}" keryx-miner )
+          ( cd integrations/hiveos && bash createmanifest.sh "${TAG#v}" keryx-miner )
           mkdir -p "$pkg"
           cp integrations/hiveos/h-config.sh \
              integrations/hiveos/h-run.sh \
@@ -64,27 +164,17 @@ jobs:
           cp target/release/keryx-miner "$pkg/keryx-miner"
           strip "$pkg/keryx-miner" || true
           chmod +x "$pkg"/*.sh "$pkg/keryx-miner"
-          tar czvf "keryx-miner-${tag}-hiveos.tgz" "$pkg"
+          tar czvf "keryx-miner-${TAG}-hiveos.tgz" "$pkg"
 
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          cargo build --release --bin keryx-miner
-          asset="keryx-miner-${{ github.event.release.tag_name }}-win64-amd64"
-          mkdir "$asset"
-          cp target/release/keryx-miner.exe "$asset/keryx-miner.exe"
-          cp start-miner.bat "$asset/" 2>/dev/null || true
-          cp README.md "$asset/" 2>/dev/null || true
-          7z a -tzip "$asset.zip" "$asset"
-          echo "ASSET=$asset.zip" >> "$GITHUB_ENV"
+      - name: Upload artifacts (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-assets
+          path: |
+            keryx-miner-*.tgz
 
       - name: Attach to release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          # env.ASSET is the per-OS binary (literal path, always present). The hiveos
-          # line is a glob: it matches on the Linux runner and is harmlessly skipped on
-          # Windows where no such file was produced.
-          files: |
-            ${{ env.ASSET }}
-            keryx-miner-*-hiveos.tgz
+          files: keryx-miner-*.tgz
