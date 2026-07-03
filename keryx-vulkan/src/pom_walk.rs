@@ -11,11 +11,18 @@ const POM_WALK_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk.s
 /// POM_WALK_STEPS — must match `pom::POM_WALK_STEPS` and the node.
 pub const POM_WALK_STEPS: u32 = 256;
 
-/// Push-constant block — layout MUST match the `Push` block in `pom_walk.comp` (std430: twelve u64
-/// at 0..96, then three u32 at 96, 100, 104; total 112 bytes incl. tail pad). The weight blob is
-/// split into power-of-two-sized shards (each a separate device-address buffer, ≤ the 2 GiB
-/// `maxMemoryAllocationSize`); the shader maps a chunk to its shard via `shard_shift`/`shard_mask`
-/// and reads the shard's GPU address from a small bound address table.
+/// Compute `floor(2^64 / d)` — the magic multiplier for Granlund-Montgomery fast 64-bit modulo.
+/// The shader uses `mul_hi(x, mod_magic)` to approximate the quotient, then corrects with a
+/// conditional subtract. `floor(2^64 / d)` guarantees the quotient never overshoots (unlike
+/// `ceil(2^64 / d)`, which can produce q = floor(x/d)+1 for some x, making x − q*d wrap near
+/// 2^64 — a single correction branch can't fix it → GPU page fault → DEVICE_LOST).
+fn mod_magic(d: u64) -> u64 {
+    u64::MAX / d
+}
+
+/// Push-constant block — layout MUST match the `Push` block in `pom_walk.comp` (std430: thirteen
+/// u64 at 0..104, then three u32 at 104, 108, 112; total 120 bytes incl. tail pad). `mod_magic` is
+/// `floor(2^64 / n_chunks)`, precomputed for the fast 64-bit modulo (Granlund-Montgomery mul_hi).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PomPush {
@@ -25,6 +32,7 @@ struct PomPush {
     n_chunks: u64,
     start_nonce: u64,
     shard_mask: u64, // chunks_per_shard - 1
+    mod_magic: u64,  // floor(2^64 / n_chunks) — fast_mod multiplier
     k: u32,
     batch: u32,
     shard_shift: u32, // log2(chunks_per_shard)
@@ -37,10 +45,11 @@ const NO_WINNER: u32 = 0xFFFF_FFFF;
 /// chunk to (shard, offset) with a shift + mask instead of 64-bit divide.
 const SHARD_CHUNKS: u64 = 1 << 25;
 
-/// Max nonces per GPU dispatch. The walk is latency-bound (256 dependent reads/nonce), so a full
-/// 1<<20 batch in one dispatch can exceed the Windows TDR watchdog (~2 s) and lose the device.
-/// 65,536 keeps each dispatch to a few ms on device-local VRAM while staying far above launch cost.
-const MAX_DISPATCH_NONCES: u32 = 1 << 16;
+/// Max nonces per GPU dispatch. Matching POM_BATCH (1<<20) eliminates the sub-dispatch loop:
+/// one dispatch per miner call instead of four, cutting fence-wait + readback overhead. With 256
+/// threads per workgroup, 1M nonces = 4096 workgroups, well under the 2 s Windows TDR limit
+/// (a single walk dispatch takes ~150 ms at 6+ MH/s).
+const MAX_DISPATCH_NONCES: u32 = 1 << 20;
 
 /// Resident GPU PoM miner: the weight blob lives in a storage buffer; `mine` re-dispatches the
 /// walk over nonce batches. Build once per mining tier (the weight blob is large).
@@ -115,10 +124,10 @@ impl PomWalkGpu {
 
     /// Search nonces `[start, start + batch)`. Returns the lowest winning nonce, or None.
     ///
-    /// The batch is ground in `MAX_DISPATCH_NONCES`-sized sub-dispatches, in increasing nonce order,
-    /// so no single GPU dispatch runs long enough to trip the Windows TDR watchdog (DEVICE_LOST).
-    /// Sub-batches are ascending, so the first one with any winner holds the global lowest nonce —
-    /// returning there is identical to grinding the whole batch, and skips the rest.
+    /// The full batch is dispatched in `MAX_DISPATCH_NONCES`-sized chunks (default 1<<20), well
+    /// under the 2 s Windows TDR limit. Sub-batches are ascending, so the first one with any winner
+    /// holds the global lowest nonce — returning there is identical to grinding the whole batch,
+    /// and skips the rest.
     pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
         let mut done: u32 = 0;
         while done < batch {
@@ -131,11 +140,12 @@ impl PomWalkGpu {
                 n_chunks: self.n_chunks,
                 start_nonce: start + done as u64,
                 shard_mask: self.shard_chunks - 1,
+                mod_magic: mod_magic(self.n_chunks),
                 k: POM_WALK_STEPS,
                 batch: sub,
                 shard_shift: self.shard_chunks.trailing_zeros(),
             };
-            let groups = sub.div_ceil(64); // local_size_x = 64
+            let groups = sub.div_ceil(256); // local_size_x = 256
             self.vk.dispatch(&self.kernel, &[&self.winner, &self.addr_table], push_bytes(&push), groups);
 
             let mut out = [0u8; 4];
