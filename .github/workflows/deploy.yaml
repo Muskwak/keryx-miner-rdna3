@@ -64,19 +64,23 @@ jobs:
       - name: MSVC dev environment
         uses: ilammy/msvc-dev-cmd@v1
 
+      # pwsh, not bash: under bash, Git's coreutils link.exe shadows MSVC's linker in the
+      # vcvars environment and rustc fails with "link.exe returned an unexpected error".
       - name: Build zero-dup (in-process llama.cpp variant)
-        shell: bash
+        shell: pwsh
         env:
           # bindgen needs libclang; LLVM is preinstalled on windows runners.
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
           CMAKE_GENERATOR: Ninja
         run: |
           cargo build --release --features zero-dup --bin keryx-miner
-          asset="keryx-miner-${TAG}-win64-amd64-zerodup"
-          mkdir "$asset"
-          cp target/release/keryx-miner.exe "$asset/"
-          cp start-miner.bat README.md "$asset/" 2>/dev/null || true
-          7z a -tzip "$asset.zip" "$asset"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $asset = "keryx-miner-$env:TAG-win64-amd64-zerodup"
+          New-Item -ItemType Directory $asset | Out-Null
+          Copy-Item target/release/keryx-miner.exe $asset/
+          foreach ($f in @('start-miner.bat', 'README.md')) { if (Test-Path $f) { Copy-Item $f $asset/ } }
+          7z a -tzip "$asset.zip" $asset
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Upload artifacts (always)
         uses: actions/upload-artifact@v4
@@ -117,10 +121,23 @@ jobs:
           # newer glibc than this container — pin 1.3.268 (the last focal-era SDK; its glslang
           # already knows GL_EXT_integer_dot_product / buffer_reference / int64, everything the
           # keryx shaders use). VULKAN_SDK/PATH also let ggml's vulkan-shaders-gen find glslc.
-          ver=1.3.268.0
-          wget -qO /tmp/vulkansdk.tar.xz "https://sdk.lunarg.com/sdk/download/${ver}/linux/vulkansdk-linux-x86_64-${ver}.tar.xz"
+          # LunarG's exact download filename varies across SDK generations — try candidates
+          # (newest focal-compatible first) and take the first that downloads.
+          ok=""
+          for u in \
+            "https://sdk.lunarg.com/sdk/download/1.3.268.0/linux/vulkan_sdk.tar.xz" \
+            "https://sdk.lunarg.com/sdk/download/1.3.268.0/linux/vulkansdk-linux-x86_64-1.3.268.0.tar.xz" \
+            "https://sdk.lunarg.com/sdk/download/1.3.261.1/linux/vulkan_sdk.tar.xz" \
+            "https://sdk.lunarg.com/sdk/download/1.3.261.1/linux/vulkansdk-linux-x86_64-1.3.261.1.tar.xz" \
+            "https://sdk.lunarg.com/sdk/download/1.3.250.1/linux/vulkan_sdk.tar.gz" \
+            "https://sdk.lunarg.com/sdk/download/1.3.250.1/linux/vulkansdk-linux-x86_64-1.3.250.1.tar.gz" \
+          ; do
+            echo "trying $u"
+            if wget -qO /tmp/vulkansdk.tar "$u"; then ok=1; break; fi
+          done
+          test -n "$ok" || { echo "no focal-era Vulkan SDK tarball reachable"; exit 1; }
           mkdir -p /opt/vulkan-sdk
-          tar -xf /tmp/vulkansdk.tar.xz -C /opt/vulkan-sdk
+          tar -xf /tmp/vulkansdk.tar -C /opt/vulkan-sdk
           glslc_bin="$(find /opt/vulkan-sdk -type f -name glslc | head -n1)"
           test -n "$glslc_bin"
           sdkroot="$(dirname "$(dirname "$glslc_bin")")"
