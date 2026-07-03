@@ -113,7 +113,7 @@ jobs:
           set -euxo pipefail
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates curl wget gnupg xz-utils git python3 \
+            ca-certificates curl wget gnupg xz-utils unzip git python3 \
             build-essential gcc-10 g++-10 ninja-build pkg-config \
             clang-12 libclang-12-dev libvulkan-dev p7zip-full
           # llama.cpp wants a newer cmake than focal's 3.16 — Kitware maintains a focal repo.
