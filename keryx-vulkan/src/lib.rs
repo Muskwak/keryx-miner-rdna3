@@ -7,6 +7,7 @@
 //! built on top of this in their own modules.
 
 use ash::vk;
+use ash::vk::Handle;
 use std::ffi::{CStr, CString};
 
 pub mod khh;
@@ -98,9 +99,17 @@ pub fn inference_device_index() -> usize {
     devices.iter().find(|d| d.discrete).map(|d| d.index).unwrap_or(0)
 }
 
+/// Zero-dup: routes a queue submission through an external owner's guarded submit hook
+/// (ggml-vulkan's mutex-protected compute queue) instead of a queue we own. Arguments are
+/// FFI-shaped so the miner can wrap the ggml C export without depending on ash:
+/// `(submit_info: *const VkSubmitInfo, fence: VkFence-as-u64)`.
+pub type ExternalSubmit = Box<dyn Fn(*const std::ffi::c_void, u64) + Send + Sync>;
+
 /// A ready-to-use compute device: instance, the chosen physical device, a logical device with a
 /// compute queue, and a command pool. One per (worker, kernel family) — on multi-GPU rigs each
-/// worker opens its own `Vk` bound to its device index.
+/// worker opens its own `Vk` bound to its device index. Alternatively BORROWED from another
+/// Vulkan owner in-process (ggml) via [`Vk::from_raw_handles`]: then only the command pool is
+/// ours, and submissions route through the owner's guarded hook.
 pub struct Vk {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -115,6 +124,10 @@ pub struct Vk {
     cmd_pool: vk::CommandPool,
     device_name: String,
     device_index: usize,
+    /// False when the instance/device are borrowed (ggml owns them; we only own cmd_pool).
+    owned: bool,
+    /// Present iff borrowed: the owner's serialized queue-submit hook.
+    external_submit: Option<ExternalSubmit>,
 }
 
 impl Vk {
@@ -228,7 +241,72 @@ impl Vk {
                 cmd_pool,
                 device_name,
                 device_index,
+                owned: true,
+                external_submit: None,
             })
+        }
+    }
+
+    /// Zero-dup: wrap ANOTHER in-process Vulkan owner's live handles (ggml's instance /
+    /// physical device / device) so kernels built here read buffers created there — buffer
+    /// device addresses are only valid on the device that owns them. We create only a command
+    /// pool; every submission routes through `external_submit` (the owner's mutex-guarded
+    /// queue hook), and Drop releases only what we created.
+    ///
+    /// # Safety
+    /// The handles must remain valid for this `Vk`'s lifetime (ggml keeps its device alive for
+    /// the process lifetime; the shared PoM walk is torn down before engine eviction anyway).
+    pub unsafe fn from_raw_handles(
+        instance_ptr: *mut std::ffi::c_void,
+        physical_device_ptr: *mut std::ffi::c_void,
+        device_ptr: *mut std::ffi::c_void,
+        queue_family: u32,
+        device_index: usize,
+        external_submit: ExternalSubmit,
+    ) -> Result<Self, String> {
+        let entry = ash::Entry::load().map_err(|e| format!("Vulkan loader (vulkan-1) not found: {e}"))?;
+        let instance = ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(instance_ptr as u64));
+        let pdevice = vk::PhysicalDevice::from_raw(physical_device_ptr as u64);
+        let device = ash::Device::load(instance.fp_v1_0(), vk::Device::from_raw(device_ptr as u64));
+        let props = instance.get_physical_device_properties(pdevice);
+        let device_name = cstr_array_to_string(&props.device_name);
+        let mem_props = instance.get_physical_device_memory_properties(pdevice);
+        let cmd_pool = device
+            .create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(queue_family)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+            .map_err(|e| format!("create_command_pool (borrowed device): {e}"))?;
+        Ok(Self {
+            _entry: entry,
+            instance,
+            device,
+            pdevice,
+            queue: vk::Queue::null(), // never used: submissions go through external_submit
+            queue_family,
+            mem_props,
+            cmd_pool,
+            device_name,
+            device_index,
+            owned: false,
+            external_submit: Some(external_submit),
+        })
+    }
+
+    /// Submit one batch on the compute queue: ours directly, or the borrowed owner's through
+    /// its guarded hook (VkSubmitInfo is ABI-stable, so the raw pointer cast is sound).
+    unsafe fn queue_submit_routed(&self, submit: &vk::SubmitInfo, fence: vk::Fence) -> Result<(), String> {
+        match &self.external_submit {
+            Some(hook) => {
+                hook(submit as *const vk::SubmitInfo as *const std::ffi::c_void, fence.as_raw());
+                Ok(())
+            }
+            None => self
+                .device
+                .queue_submit(self.queue, std::slice::from_ref(submit), fence)
+                .map_err(|e| e.to_string()),
         }
     }
 
@@ -497,9 +575,7 @@ impl Vk {
             let fence = self.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| e.to_string())?;
             let submit = vk::SubmitInfo::default().command_buffers(&cmds);
             let res = self
-                .device
-                .queue_submit(self.queue, &[submit], fence)
-                .map_err(|e| e.to_string())
+                .queue_submit_routed(&submit, fence)
                 .and_then(|_| self.device.wait_for_fences(&[fence], true, u64::MAX).map_err(|e| e.to_string()));
             self.device.destroy_fence(fence, None);
             res
@@ -660,7 +736,7 @@ impl Vk {
             let cmds = [k.cmd];
             let submit = vk::SubmitInfo::default().command_buffers(&cmds);
             dev.reset_fences(&[k.fence]).unwrap();
-            dev.queue_submit(self.queue, &[submit], k.fence).unwrap();
+            self.queue_submit_routed(&submit, k.fence).expect("queue submit");
             dev.wait_for_fences(&[k.fence], true, u64::MAX).unwrap();
         }
     }
@@ -689,10 +765,17 @@ impl Vk {
 impl Drop for Vk {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.device.device_wait_idle();
-            self.device.destroy_command_pool(self.cmd_pool, None);
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
+            if self.owned {
+                let _ = self.device.device_wait_idle();
+                self.device.destroy_command_pool(self.cmd_pool, None);
+                self.device.destroy_device(None);
+                self.instance.destroy_instance(None);
+            } else {
+                // Borrowed (ggml) device: we own only the command pool. Every submission is
+                // fence-waited before its caller returns, so the pool is idle; skipping
+                // device_wait_idle avoids stalling the owner's in-flight inference work.
+                self.device.destroy_command_pool(self.cmd_pool, None);
+            }
         }
     }
 }

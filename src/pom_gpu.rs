@@ -26,10 +26,42 @@ fn hex32(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
+/// One resident PoM miner: either a miner-owned streamed weight blob, or (zero-dup) the walk
+/// over the in-process inference engine's own resident weight buffers on the inference GPU —
+/// no extra VRAM there. The Shared variant holds the engine Arc so the model can never be
+/// freed underneath an in-flight walk dispatch (field order: walk drops first).
+#[derive(Clone)]
+enum Resident {
+    Blob(Arc<PomWalkGpu>),
+    #[cfg(feature = "zero-dup")]
+    Shared { walk: Arc<keryx_vulkan::pom_walk::PomWalkShared>, _engine: Arc<crate::llm_engine::LlamaEngine> },
+}
+
+impl Resident {
+    fn mine(&self, pph: &[u8; 32], ts: u64, target: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
+        match self {
+            Resident::Blob(m) => m.mine(pph, ts, target, start, batch),
+            #[cfg(feature = "zero-dup")]
+            Resident::Shared { walk, .. } => walk.mine(pph, ts, target, start, batch),
+        }
+    }
+
+    /// EXTRA VRAM the miner itself holds for this entry: the blob's n_chunks*32, or 0 for the
+    /// shared walk (weights belong to the inference engine either way).
+    fn extra_vram_bytes(&self) -> u64 {
+        match self {
+            Resident::Blob(m) => m.n_chunks() * 32,
+            #[cfg(feature = "zero-dup")]
+            Resident::Shared { .. } => 0,
+        }
+    }
+}
+
 /// Resident GPU PoM miners, one per mining device (raw Vulkan device index). An entry is dropped
-/// to free that device's VRAM (inference has priority on the inference device). `Arc` so `mine`
-/// can dispatch without holding the map lock — N GPUs must not serialize each other's batches.
-static MINERS: Mutex<Option<HashMap<u32, Arc<PomWalkGpu>>>> = Mutex::new(None);
+/// to free that device's VRAM (inference has priority on the inference device). The payloads are
+/// `Arc`ed so `mine` can dispatch without holding the map lock — N GPUs must not serialize each
+/// other's batches.
+static MINERS: Mutex<Option<HashMap<u32, Resident>>> = Mutex::new(None);
 
 /// Mining-tier identity for (re)builds: (model_id, gguf_path). Set once at startup.
 static MINING_TIER: OnceLock<([u8; 32], String)> = OnceLock::new();
@@ -53,16 +85,16 @@ pub fn is_installed(device: u32) -> bool {
 }
 
 /// The resident miner for `device`, if installed.
-fn miner_on(device: u32) -> Option<Arc<PomWalkGpu>> {
+fn miner_on(device: u32) -> Option<Resident> {
     MINERS.lock().ok()?.as_ref()?.get(&device).cloned()
 }
 
-/// VRAM bytes occupied by the resident PoM weight blob (`n_chunks * 32`) on the INFERENCE device,
-/// or 0 if not installed there. Inference uses this to decide whether the blob can stay resident
-/// alongside the served model instead of being unloaded + later re-staged on every challenge.
-/// Blobs on other mining devices never compete with inference, so they are not counted.
+/// EXTRA VRAM the miner holds on the INFERENCE device, or 0 if nothing is installed there.
+/// Inference uses this to decide whether the blob can stay resident alongside the served model.
+/// A zero-dup shared walk reports 0 — the weights are the engine's own, so there is nothing to
+/// evict. Blobs on other mining devices never compete with inference, so they are not counted.
 pub fn resident_blob_bytes() -> u64 {
-    miner_on(keryx_vulkan::inference_device_index() as u32).map(|m| m.n_chunks() * 32).unwrap_or(0)
+    miner_on(keryx_vulkan::inference_device_index() as u32).map(|m| m.extra_vram_bytes()).unwrap_or(0)
 }
 
 /// Drop the INFERENCE device's GPU PoM miner, freeing its weight-blob VRAM so inference (priority)
@@ -87,8 +119,8 @@ pub fn mine(
     start: u64,
     batch: u64,
 ) -> Option<u64> {
-    // Clone the Arc out and dispatch lock-free: each device has exactly one worker thread, and
-    // holding the map lock across a multi-ms walk batch would serialize the other GPUs.
+    // Clone the (Arc-backed) entry out and dispatch lock-free: each device has exactly one
+    // worker thread, and holding the map lock across a walk batch would serialize other GPUs.
     let m = miner_on(device)?;
     let batch = batch.min(u32::MAX as u64) as u32;
     m.mine(pre_pow_hash, timestamp, target_le, start, batch)
@@ -184,14 +216,33 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
         }
     }
 
-    // Stream the canonical weight blob from the GGUF straight into this device's VRAM through the
-    // index's chunk table — no packed host copy (the old `load_weight_words` Vec was ~1x model
-    // size). The blob N equals the index N by construction (same table), so the proof-vs-blob
-    // N-guard the packed loader needed is structural here.
     let (idx, _) = match crate::pom::active_index() {
         Some(x) => x,
         None => return false,
     };
+
+    // Zero-dup: on the inference GPU, walk the in-process engine's own resident weight
+    // buffers — 0 extra VRAM — instead of installing a second copy. Any failure falls back
+    // to the streamed blob below (correct, just costs the duplicate VRAM).
+    #[cfg(feature = "zero-dup")]
+    if device == keryx_vulkan::inference_device_index() as u32 {
+        match install_shared(idx, model_id) {
+            Ok(entry) => {
+                if let Ok(mut g) = MINERS.lock() {
+                    g.get_or_insert_with(HashMap::new).insert(device, entry);
+                }
+                return true;
+            }
+            Err(e) => {
+                log::warn!("PoM(zero-dup): shared install failed ({e}) — falling back to the streamed blob");
+            }
+        }
+    }
+
+    // Stream the canonical weight blob from the GGUF straight into this device's VRAM through the
+    // index's chunk table — no packed host copy (the old `load_weight_words` Vec was ~1x model
+    // size). The blob N equals the index N by construction (same table), so the proof-vs-blob
+    // N-guard the packed loader needed is structural here.
     info!("PoM(vulkan): streaming weight blob into VRAM on device {}…", device);
     let mut source = |first_chunk: u64, out: &mut [u8]| {
         idx.read_chunk_range(first_chunk, out).map_err(|e| format!("GGUF chunk stream failed: {e}"))
@@ -205,7 +256,7 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
                 idx.n_chunks
             );
             if let Ok(mut g) = MINERS.lock() {
-                g.get_or_insert_with(HashMap::new).insert(device, Arc::new(gpu));
+                g.get_or_insert_with(HashMap::new).insert(device, Resident::Blob(Arc::new(gpu)));
             }
             true
         }
@@ -214,4 +265,62 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
             false
         }
     }
+}
+
+/// Build the zero-dup shared walk over the inference engine's resident weights and refuse to
+/// mine on any layout disagreement with the possession index: per-tensor chunk table in the
+/// canonical name-sorted order, hard N equality, plus a random chunk sample fetched through the
+/// GPU table and compared byte-for-byte against the GGUF-backed index — a mismatch would mean
+/// every mined block gets rejected, so it aborts the shared path entirely.
+#[cfg(feature = "zero-dup")]
+fn install_shared(idx: &'static crate::pom::WeightIndex, model_id: &[u8; 32]) -> Result<Resident, String> {
+    // The engine must be serving the MINING model (post-PoM: serving == mining tier). This
+    // loads it resident on the inference GPU if it is not already.
+    if !crate::slm::ensure_loaded(model_id) {
+        return Err("inference engine failed to load the mining model".into());
+    }
+    let engine = crate::slm::active_engine(model_id).ok_or("engine not resident after ensure_loaded")?;
+
+    // Canonical table over the engine's tensors: VK-resident walked in place, host-side ones
+    // (llama keeps token_embd on CPU under Vulkan) supplemented into a small owned buffer.
+    let (walk, supl_bytes) = engine.build_shared_walk().map_err(|e| e.to_string())?;
+
+    if walk.n_chunks() != idx.n_chunks {
+        return Err(format!(
+            "shared table N={} != index N={} — layout mismatch, refusing to mine on shared weights",
+            walk.n_chunks(),
+            idx.n_chunks
+        ));
+    }
+
+    // Sample-verify: 256 deterministic pseudo-random chunks through the GPU table vs the index.
+    // Catches any addressing/ordering error with overwhelming probability before a single
+    // nonce is mined off the shared weights.
+    let mut x: u64 = 0x9E3779B97F4A7C15 ^ idx.n_chunks;
+    for _ in 0..256 {
+        // splitmix64 step
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        let off = (z ^ (z >> 31)) % idx.n_chunks;
+
+        let gpu = walk.read_chunk(off);
+        let mut gpu_words = [0u64; 4];
+        for (i, w) in gpu_words.iter_mut().enumerate() {
+            *w = u64::from_le_bytes(gpu[i * 8..i * 8 + 8].try_into().unwrap());
+        }
+        if gpu_words != idx.read_chunk(off) {
+            return Err(format!("chunk {off} differs between shared weights and the possession index"));
+        }
+    }
+
+    info!(
+        "PoM(zero-dup): walking inference's resident weights on {} — N={} chunks, {} MB supplemented \
+         (host-side tensors), rest walked in place (sample-verify passed)",
+        walk.device_name(),
+        walk.n_chunks(),
+        supl_bytes / (1024 * 1024)
+    );
+    Ok(Resident::Shared { walk: Arc::new(walk), _engine: engine })
 }

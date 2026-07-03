@@ -149,6 +149,141 @@ impl LlamaEngine {
     }
 }
 
+/// Where a weight tensor's bytes live, as seen by the shared PoM walk.
+#[cfg(feature = "zero-dup")]
+pub enum TensorLoc {
+    /// VK-resident in ggml's buffers: walked in place — zero duplication.
+    Vk(u64),
+    /// Kept host-side by llama.cpp (e.g. `token_embd.weight` under the Vulkan backend):
+    /// bytes copied out so the caller can upload them to a small supplement buffer.
+    Host(Vec<u8>),
+}
+
+/// One weight tensor of the resident model as seen by the shared PoM walk.
+#[cfg(feature = "zero-dup")]
+pub struct SharedTensor {
+    pub name: String,
+    pub size: u64,
+    pub loc: TensorLoc,
+}
+
+#[cfg(feature = "zero-dup")]
+impl LlamaEngine {
+    /// Table of the resident model's weight tensors (load order — the caller sorts into the
+    /// canonical name order). VK-resident tensors carry their GPU address; tensors llama.cpp
+    /// keeps host-side (the Vulkan backend does this for `token_embd.weight`) carry their raw
+    /// bytes for supplement upload — the walk needs every canonical chunk GPU-reachable.
+    pub fn tensor_table(&self) -> Result<Vec<SharedTensor>> {
+        let model = self.model.as_raw();
+        let n = unsafe { llama_cpp_sys_2::llama_model_keryx_n_tensors(model) };
+        let mut out = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let t = unsafe { llama_cpp_sys_2::llama_model_keryx_tensor(model, i) };
+            if t.is_null() {
+                return Err(anyhow!("zero-dup: tensor {i} is null"));
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr(llama_cpp_sys_2::ggml_get_name(t)) }
+                .to_string_lossy()
+                .into_owned();
+            let size = unsafe { llama_cpp_sys_2::ggml_nbytes(t) } as u64;
+            let (mut gpu_addr, mut vk_size) = (0u64, 0u64);
+            let loc = if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_tensor_addr(t, &mut gpu_addr, &mut vk_size) } {
+                TensorLoc::Vk(gpu_addr)
+            } else {
+                // Host-resident (CPU / pinned buffer): tensor->data is a real host pointer
+                // holding the verbatim GGUF block bytes.
+                let data = unsafe { (*t).data } as *const u8;
+                if data.is_null() {
+                    return Err(anyhow!("zero-dup: tensor '{name}' has no VK address and no host data"));
+                }
+                TensorLoc::Host(unsafe { std::slice::from_raw_parts(data, size as usize) }.to_vec())
+            };
+            out.push(SharedTensor { name, size, loc });
+        }
+        Ok(out)
+    }
+
+    /// Assemble the complete shared PoM walk over this engine's resident model: VK-resident
+    /// tensors are walked IN PLACE (zero duplication); tensors llama.cpp keeps host-side
+    /// (`token_embd.weight` under the Vulkan backend) are uploaded once into a small
+    /// miner-owned supplement buffer on ggml's device so every canonical chunk is
+    /// GPU-reachable. Returns the walk plus the supplement size in bytes (0 = true zero-dup).
+    pub fn build_shared_walk(&self) -> Result<(keryx_vulkan::pom_walk::PomWalkShared, u64)> {
+        let mut tensors = self.tensor_table()?;
+        // Canonical name order (byte-wise, matching pom::WeightIndex / the node's R_T).
+        tensors.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Supplement blob: full chunks of every host-side tensor, in canonical order.
+        let mut supplement: Vec<u8> = Vec::new();
+        // (needs_supplement_base, addr_or_offset, chunks) per table entry, canonical order.
+        let mut entries: Vec<(bool, u64, u64)> = Vec::with_capacity(tensors.len());
+        for t in &tensors {
+            let chunks = t.size / 32;
+            if chunks == 0 {
+                continue; // sub-chunk tensors are not part of the canonical layout
+            }
+            match &t.loc {
+                TensorLoc::Vk(addr) => entries.push((false, *addr, chunks)),
+                TensorLoc::Host(bytes) => {
+                    let off = supplement.len() as u64;
+                    supplement.extend_from_slice(&bytes[..(chunks * 32) as usize]);
+                    entries.push((true, off, chunks));
+                }
+            }
+        }
+
+        let vk = self.walk_device()?;
+        let supl_bytes = supplement.len() as u64;
+        let mut supplements = Vec::new();
+        let supl_addr = if supplement.is_empty() {
+            0
+        } else {
+            let (buf, addr) = vk
+                .create_device_local_address_buffer(&supplement)
+                .map_err(|e| anyhow!("zero-dup: supplement upload failed: {e}"))?;
+            supplements.push(buf);
+            addr
+        };
+
+        let table: Vec<(u64, u64)> = entries
+            .iter()
+            .map(|&(host, a, chunks)| (if host { supl_addr + a } else { a }, chunks))
+            .collect();
+        let walk = keryx_vulkan::pom_walk::PomWalkShared::new(vk, &table, supplements)
+            .map_err(|e| anyhow!("zero-dup: shared walk build failed: {e}"))?;
+        Ok((walk, supl_bytes))
+    }
+
+    /// Borrow ggml's Vulkan device (its device 0 — pinning makes that the inference GPU) so
+    /// the walk kernel can dereference the tensor addresses. Submissions route through ggml's
+    /// queue-mutex-guarded hook, so they never race inference on the shared compute queue.
+    pub fn walk_device(&self) -> Result<keryx_vulkan::Vk> {
+        let mut instance = std::ptr::null_mut();
+        let mut physical = std::ptr::null_mut();
+        let mut device = std::ptr::null_mut();
+        let mut qfi = 0u32;
+        if !unsafe {
+            llama_cpp_sys_2::ggml_backend_vk_keryx_raw_handles(0, &mut instance, &mut physical, &mut device, &mut qfi)
+        } {
+            return Err(anyhow!("zero-dup: ggml Vulkan raw handles unavailable (no device or no bufferDeviceAddress)"));
+        }
+        let submit: keryx_vulkan::ExternalSubmit = Box::new(|submit_info, fence| unsafe {
+            llama_cpp_sys_2::ggml_backend_vk_keryx_queue_submit(0, submit_info, fence as usize as *mut std::ffi::c_void);
+        });
+        unsafe {
+            keryx_vulkan::Vk::from_raw_handles(
+                instance,
+                physical,
+                device,
+                qfi,
+                keryx_vulkan::inference_device_index(),
+                submit,
+            )
+        }
+        .map_err(|e| anyhow!("zero-dup: borrowing ggml's device failed: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

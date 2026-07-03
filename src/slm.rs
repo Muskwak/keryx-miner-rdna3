@@ -300,6 +300,15 @@ pub fn set_v2_lineup(specs: &'static [&'static ModelSpec]) {
     *LINEUP_V2.write().unwrap() = specs;
 }
 
+/// Zero-dup: the resident in-process engine currently serving `model_id`, if any. The shared
+/// PoM walk holds this Arc for as long as it walks the engine's weight buffers, so the model
+/// cannot be freed underneath an in-flight dispatch.
+#[cfg(feature = "zero-dup")]
+pub fn active_engine(model_id: &[u8; 32]) -> Option<Arc<InferenceEngine>> {
+    let g = SERVER.lock().ok()?;
+    g.as_ref().filter(|(id, _)| id == model_id).map(|(_, e)| Arc::clone(e))
+}
+
 /// Drop the running llama-server so the next inference relaunches from the current lineup.
 pub fn evict_engine() {
     match SERVER.lock() {

@@ -198,6 +198,181 @@ impl Drop for PomWalkGpu {
     }
 }
 
+/// SPIR-V for the zero-dup prefix-table walk + the chunk-fetch verifier.
+const POM_WALK_PREFIX_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk_prefix.spv"));
+const POM_FETCH_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_fetch.spv"));
+
+/// Push-constant block for `pom_walk_prefix.comp` (std430: eleven u64 at 0..88, three u32 at
+/// 88..100; padded to 104).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PomPrefixPush {
+    p: [u64; 4],
+    t: [u64; 4],
+    timestamp: u64,
+    n_chunks: u64,
+    start_nonce: u64,
+    k: u32,
+    batch: u32,
+    n_tensors: u32,
+    _pad: u32,
+}
+
+/// Push-constant block for `pom_fetch.comp`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FetchPush {
+    chunk: u64,
+    n_tensors: u32,
+    _pad: u32,
+}
+
+/// ZERO-DUP resident PoM miner: walks the inference engine's own weight tensors (ggml-vulkan
+/// buffers, reached by buffer device address) via a per-tensor prefix table — no miner-owned
+/// weight copy exists. Built over a [`Vk`] wrapping ggml's device (`Vk::from_raw_handles`);
+/// every dispatch routes through ggml's guarded queue hook. Must be dropped BEFORE the
+/// inference engine unloads the model that owns the tensors.
+pub struct PomWalkShared {
+    vk: Vk,
+    walk: Kernel,
+    fetch: Kernel,
+    prefix: GpuBuffer, // binding 1: n_tensors + 1 cumulative chunk starts (u64)
+    addrs: GpuBuffer,  // binding 2: n_tensors GPU virtual addresses (u64)
+    winner: GpuBuffer,
+    out32: GpuBuffer, // 32-byte readback target for the chunk-fetch verifier
+    /// Miner-owned supplement buffers for tensors the engine keeps host-side (their table
+    /// addresses point in here); owned so they live exactly as long as the walk.
+    supplements: Vec<GpuBuffer>,
+    n_chunks: u64,
+    n_tensors: u32,
+}
+
+impl PomWalkShared {
+    /// Build over `tensors`: one `(gpu_addr, n_chunks)` per tensor in CANONICAL (name-sorted)
+    /// order, zero-chunk tensors already skipped — the same layout `pom::WeightIndex` indexes,
+    /// so canonical chunk `i` resolves to the identical bytes the node pinned in `R_T`.
+    /// `supplements`: buffers (created on the same `vk`) that back any non-engine-resident
+    /// table entries; ownership transfers here.
+    pub fn new(vk: Vk, tensors: &[(u64, u64)], supplements: Vec<GpuBuffer>) -> Result<Self, String> {
+        if tensors.is_empty() {
+            return Err("shared PoM walk: empty tensor table".into());
+        }
+        let n_tensors = u32::try_from(tensors.len()).map_err(|_| "tensor table too large")?;
+        let mut prefix: Vec<u64> = Vec::with_capacity(tensors.len() + 1);
+        let mut addrs: Vec<u64> = Vec::with_capacity(tensors.len());
+        let mut total: u64 = 0;
+        for &(addr, chunks) in tensors {
+            if addr == 0 || chunks == 0 {
+                return Err("shared PoM walk: null address or empty tensor in table".into());
+            }
+            prefix.push(total);
+            addrs.push(addr);
+            total += chunks;
+        }
+        prefix.push(total); // sentinel: prefix[n_tensors] == n_chunks
+        if total == 0 {
+            return Err("shared PoM walk: table produced 0 chunks".into());
+        }
+
+        let walk_spirv = ash::util::read_spv(&mut Cursor::new(POM_WALK_PREFIX_SPV)).map_err(|e| e.to_string())?;
+        let walk = vk.make_kernel(&walk_spirv, 3, std::mem::size_of::<PomPrefixPush>() as u32)?;
+        let fetch_spirv = ash::util::read_spv(&mut Cursor::new(POM_FETCH_SPV)).map_err(|e| e.to_string())?;
+        let fetch = vk.make_kernel(&fetch_spirv, 3, std::mem::size_of::<FetchPush>() as u32)?;
+
+        let prefix_buf = vk.create_buffer((prefix.len() * 8) as u64)?;
+        vk.write_buffer(&prefix_buf, words_as_bytes(&prefix));
+        let addrs_buf = vk.create_buffer((addrs.len() * 8) as u64)?;
+        vk.write_buffer(&addrs_buf, words_as_bytes(&addrs));
+        let winner = vk.create_buffer(4)?;
+        let out32 = vk.create_buffer(32)?;
+
+        Ok(Self {
+            vk,
+            walk,
+            fetch,
+            prefix: prefix_buf,
+            addrs: addrs_buf,
+            winner,
+            out32,
+            supplements,
+            n_chunks: total,
+            n_tensors,
+        })
+    }
+
+    pub fn n_chunks(&self) -> u64 {
+        self.n_chunks
+    }
+
+    pub fn device_name(&self) -> &str {
+        self.vk.device_name()
+    }
+
+    /// Fetch canonical chunk `off` through the exact table + BDA path the walk uses — the
+    /// host samples random chunks against the GGUF-backed index before mining is allowed.
+    pub fn read_chunk(&self, off: u64) -> [u8; 32] {
+        assert!(off < self.n_chunks, "chunk out of range");
+        let push = FetchPush { chunk: off, n_tensors: self.n_tensors, _pad: 0 };
+        self.vk.dispatch(&self.fetch, &[&self.out32, &self.prefix, &self.addrs], fetch_push_bytes(&push), 1);
+        let mut out = [0u8; 32];
+        self.vk.read_buffer(&self.out32, &mut out);
+        out
+    }
+
+    /// Search nonces `[start, start + batch)`. Identical sub-dispatch grinding (TDR-bounded)
+    /// and lowest-winner semantics as [`PomWalkGpu::mine`].
+    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
+        let mut done: u32 = 0;
+        while done < batch {
+            let sub = (batch - done).min(MAX_DISPATCH_NONCES);
+            self.vk.write_buffer(&self.winner, &NO_WINNER.to_le_bytes());
+            let push = PomPrefixPush {
+                p: words4(pre_pow_hash),
+                t: words4(target_le),
+                timestamp,
+                n_chunks: self.n_chunks,
+                start_nonce: start + done as u64,
+                k: POM_WALK_STEPS,
+                batch: sub,
+                n_tensors: self.n_tensors,
+                _pad: 0,
+            };
+            let groups = sub.div_ceil(64); // local_size_x = 64
+            self.vk.dispatch(&self.walk, &[&self.winner, &self.prefix, &self.addrs], prefix_push_bytes(&push), groups);
+
+            let mut out = [0u8; 4];
+            self.vk.read_buffer(&self.winner, &mut out);
+            if let offset @ 0..=0xFFFF_FFFE = u32::from_le_bytes(out) {
+                return Some(start + done as u64 + offset as u64);
+            }
+            done += sub;
+        }
+        None
+    }
+}
+
+impl Drop for PomWalkShared {
+    fn drop(&mut self) {
+        for b in &self.supplements {
+            self.vk.destroy_buffer(b);
+        }
+        self.vk.destroy_buffer(&self.out32);
+        self.vk.destroy_buffer(&self.winner);
+        self.vk.destroy_buffer(&self.addrs);
+        self.vk.destroy_buffer(&self.prefix);
+        self.vk.destroy_kernel(&self.fetch);
+        self.vk.destroy_kernel(&self.walk);
+    }
+}
+
+fn prefix_push_bytes(p: &PomPrefixPush) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(p as *const PomPrefixPush as *const u8, std::mem::size_of::<PomPrefixPush>()) }
+}
+
+fn fetch_push_bytes(p: &FetchPush) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(p as *const FetchPush as *const u8, std::mem::size_of::<FetchPush>()) }
+}
+
 /// 32 LE bytes → 4 u64 words (matches `pom::pph_words` / `words4`).
 pub fn words4(b: &[u8; 32]) -> [u64; 4] {
     let mut w = [0u64; 4];
