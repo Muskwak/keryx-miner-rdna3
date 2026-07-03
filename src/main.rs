@@ -12,7 +12,6 @@ use rand::{thread_rng, RngCore};
 use std::fs;
 use std::sync::atomic::AtomicU16;
 use std::sync::Arc;
-use std::thread::sleep;
 use std::time::Duration;
 
 use crate::cli::Opt;
@@ -258,8 +257,40 @@ async fn client_main(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
+/// Tokio async worker count. The miner's async workload is tiny (one gRPC/stratum connection +
+/// a few tasks and timers), so we cap workers instead of spawning one per logical CPU — dozens of
+/// idle executor threads on a many-core rig are pure scheduler overhead. Override with
+/// KERYX_ASYNC_WORKERS.
+fn tokio_worker_threads() -> usize {
+    std::env::var("KERYX_ASYNC_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 8)
+}
+
+/// Optional cap for the `spawn_blocking` pool (SLM inference, IPFS upload, model prefetch). Only
+/// applied when KERYX_BLOCKING_THREADS is set: the blocking pool spawns lazily and idles out, so
+/// tokio's default costs nothing at rest and capping it low would bottleneck parallel multi-model
+/// prefetch on multi-GPU rigs.
+fn tokio_blocking_threads() -> Option<usize> {
+    std::env::var("KERYX_BLOCKING_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(2, 64))
+}
+
+fn main() -> Result<(), Error> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(tokio_worker_threads()).enable_all();
+    if let Some(n) = tokio_blocking_threads() {
+        builder.max_blocking_threads(n);
+    }
+    let rt = builder.build()?;
+    rt.block_on(run())
+}
+
+async fn run() -> Result<(), Error> {
     #[cfg(target_os = "windows")]
     adjust_console().unwrap_or_else(|e| {
         eprintln!("WARNING: Failed to protect console ({}). Any selection in console will freeze the miner.", e)
@@ -404,12 +435,9 @@ async fn main() -> Result<(), Error> {
         info!("default mode: mines Dolphin-8B under PoM.");
         keryx_miner::models::Tier::Default
     };
-    // OPoI v2 hardfork: the model lineup is DAA-gated (mirrors the node's
-    // opoi_v2_activation). Stage BOTH lineups for this tier — each filtered by what
-    // this hardware can serve (layer-A capability gate) — so the chain crossing
-    // hot-swaps without a restart:
-    //   - legacy (daa < H) is prefetched now and mined immediately;
-    //   - uncensored (daa >= H) is prefetched in the background and swapped in at H.
+    // Post-fork: OPoI-v2 (DAA 37,780,000) and H2 (DAA 38,951,445) are both in the past, so the
+    // legacy lineup (daa < opoi_v2) is dead — no fresh miner is ever pre-fork again. Stage,
+    // announce, and prefetch ONLY the uncensored post-H2 lineup, filtered by hardware capability.
     // Stage the FINAL (post-H2) lineup directly — `specs_for(VERY_LIGHT_ACTIVATION_DAA, ..)` returns
     // the latest model for the tier. For light/default/high this is identical to the OPoI-v2 model
     // (unchanged at H2); for `--very-light` it stages Qwen3-1.7B and for `--very-high` the Q2_K_L.
@@ -429,14 +457,17 @@ async fn main() -> Result<(), Error> {
     } else {
         None
     };
+    // Announce the uncensored lineup from the start. set_v2_lineup keeps the readiness-gated
+    // crossing swap a consistent no-op (it would swap v2 -> v2).
     keryx_miner::slm::set_v2_lineup(specs_v2);
     keryx_miner::slm::init_supported(specs_v2);
     log::debug!(
         "OPoI Phase-3 active — {} uncensored model(s) staged (legacy lineup dropped, post-fork).",
         specs_v2.len(),
     );
-    // Block on the uncensored lineup before mining: never start hashing while a model this miner
-    // will serve is still downloading. The legacy (pre-fork) lineup is dead and never downloaded.
+    // Block until the uncensored lineup is fully downloaded before mining: never start hashing
+    // while a model this miner will serve is still downloading. The legacy (pre-fork) lineup is
+    // dead and never downloaded.
     if keryx_miner::pow_only() {
         info!("PoW-only mode (KERYX_POW_ONLY): skipping OPoI model prefetch + inference probe.");
     } else {
@@ -537,7 +568,7 @@ async fn main() -> Result<(), Error> {
             }
         }
         info!("Client closed, reconnecting in {}s", backoff.as_secs());
-        sleep(backoff);
+        tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }

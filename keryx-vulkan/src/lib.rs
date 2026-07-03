@@ -12,6 +12,10 @@ use std::ffi::{CStr, CString};
 pub mod khh;
 pub mod pom_walk;
 
+// Opt-in PoM-walk micro-benchmark (variant kernels + timing). Excluded from the shipped miner.
+#[cfg(feature = "bench")]
+pub mod bench;
+
 /// Quick probe: the name of the Vulkan compute device, or None if no loader/device is usable.
 /// Used by the miner's startup inference check (the RDNA3 equivalent of the old cuBLAS probe).
 pub fn probe_device() -> Option<String> {

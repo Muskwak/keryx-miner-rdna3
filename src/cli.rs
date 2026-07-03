@@ -12,7 +12,7 @@ pub struct Opt {
         long = "very-light",
         help = "Model tier: Qwen3-1.7B only — any GPU (4GB+ VRAM). PoM tier 0 post-H2.",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["light", "high", "very_high"]
+        conflicts_with_all = &["light", "high", "very-high"]
     )]
     pub very_light: bool,
 
@@ -20,7 +20,7 @@ pub struct Opt {
         long = "light",
         help = "Model tier: Gemma-3-4B only — any GPU (6GB+ VRAM)",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "high", "very_high"]
+        conflicts_with_all = &["very-light", "high", "very-high"]
     )]
     pub light: bool,
 
@@ -28,7 +28,7 @@ pub struct Opt {
         long = "high",
         help = "Model tier: Gemma-3-4B + Dolphin-8B + Qwen3-32B (Q4_K_M) — RTX 3090 / 4090 / 5090 (24GB+)",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "light", "very_high"]
+        conflicts_with_all = &["very-light", "light", "very-high"]
     )]
     pub high: bool,
 
@@ -36,7 +36,7 @@ pub struct Opt {
         long = "very-high",
         help = "Model tier: Llama-3.3-70B — Q4 48GB (RTX 6000 Ada / A6000 / L40S) → Q2_K_L 32GB / RTX 5090 post-H2",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "light", "high"]
+        conflicts_with_all = &["very-light", "light", "high"]
     )]
     pub very_high: bool,
 
