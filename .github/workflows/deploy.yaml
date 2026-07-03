@@ -24,9 +24,14 @@ jobs:
   build-windows:
     name: Build windows
     runs-on: windows-latest
+    env:
+      # Fetch git deps with the git CLI (honours core.longpaths for the llama.cpp submodule).
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - name: Fix CRLF on Windows
-        run: git config --global core.autocrlf false
+      - name: Fix CRLF on Windows + long paths (llama.cpp submodule has >260-char paths)
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
 
       - uses: actions/checkout@v7
 
@@ -84,6 +89,9 @@ jobs:
     runs-on: ubuntu-latest
     # glibc 2.31 floor — matches HiveOS 20.04-based worker images.
     container: ubuntu:20.04
+    defaults:
+      run:
+        shell: bash
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:
