@@ -103,6 +103,20 @@ disk (no full-model host RAM copy — peak host overhead is a 256 MiB staging wi
 `KERYX_INFER_GPU=N`); only the worker sharing that GPU pauses during OPoI challenges — the other
 cards keep mining.
 
+### In-process inference (experimental, `--features inproc-llm`)
+
+By default OPoI inference runs in the external prebuilt `llama-server` (zero-toolchain).
+Building with `--features inproc-llm` links llama.cpp (Vulkan) into the miner via
+[`llama-cpp-2`] instead — same models, same greedy decoding through the GGUF's chat
+template, no child process — and is the groundwork for sharing one VRAM weight copy
+between inference and the PoM walk (zero-dup). It adds a C++ build to the otherwise
+zero-toolchain compile: CMake + Ninja, LLVM (`libclang` for bindgen, set `LIBCLANG_PATH`),
+and the Vulkan SDK (`glslc`). On a GNU-toolchain (MinGW) host also set
+`BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-w64-mingw32 -I<mingw>/x86_64-w64-mingw32/include -I<llvm>/lib/clang/<ver>/include"`
+and keep MinGW's `bin` on `PATH` at runtime (`libstdc++-6.dll`).
+
+[`llama-cpp-2`]: https://github.com/utilityai/llama-cpp-rs
+
 ### Solo vs pool
 
 `--keryxd-address` takes either a `grpc://` node (solo) or a `stratum+tcp://` pool URL. For pools:

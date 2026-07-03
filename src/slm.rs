@@ -8,7 +8,13 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::llama_server::LlamaServer;
+// The inference engine is chosen at compile time behind one seam: the external llama-server
+// child process (default — zero-toolchain build), or the Phase-1 in-process llama.cpp FFI
+// engine (`--features inproc-llm`). Both expose launch(gguf) + chat(system, user, max_tokens).
+#[cfg(not(feature = "inproc-llm"))]
+use crate::llama_server::LlamaServer as InferenceEngine;
+#[cfg(feature = "inproc-llm")]
+use crate::llm_engine::LlamaEngine as InferenceEngine;
 use crate::models::{ModelFormat, ModelSpec};
 
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
@@ -66,7 +72,7 @@ static LINEUP_V2: RwLock<&'static [&'static ModelSpec]> = RwLock::new(&[]);
 static V2_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// The single resident llama-server, keyed by the model it serves. `Arc` so an in-flight request
 /// can outlive an eviction (server is killed when the last `Arc` drops).
-static SERVER: Mutex<Option<([u8; 32], Arc<LlamaServer>)>> = Mutex::new(None);
+static SERVER: Mutex<Option<([u8; 32], Arc<InferenceEngine>)>> = Mutex::new(None);
 
 /// No-op in the RDNA3 fork: the Vulkan PoM miner loads its own weight blob (there is no candle
 /// zero-dup tensor sharing across the llama-server process boundary). Kept so `main` compiles.
@@ -352,7 +358,7 @@ pub fn advance_lineup_if_due(daa: u64) {
 
 /// Outcome of the startup inference probe.
 pub enum GpuProbe {
-    /// A Vulkan device is present and the llama-server binary is available — inference is ready.
+    /// A Vulkan device is present and the inference engine is available — inference is ready.
     Ok,
     /// No usable Vulkan device — GPU inference (and PoM/PoW) cannot run on this host.
     NoDevice,
@@ -360,16 +366,17 @@ pub enum GpuProbe {
     NoServer,
 }
 
-/// Verify the inference backend before mining: a Vulkan device + the llama-server binary.
+/// Verify the inference backend before mining: a Vulkan device + the inference engine.
+/// With `inproc-llm` the engine is linked into the miner, so only the device is probed.
 pub fn probe_gpu_inference() -> GpuProbe {
     match keryx_vulkan::probe_device() {
         Some(name) => {
             log::info!("Vulkan inference device: {}", name);
-            if crate::llama_server::binary_available() {
-                GpuProbe::Ok
-            } else {
-                GpuProbe::NoServer
+            #[cfg(not(feature = "inproc-llm"))]
+            if !crate::llama_server::binary_available() {
+                return GpuProbe::NoServer;
             }
+            GpuProbe::Ok
         }
         None => GpuProbe::NoDevice,
     }
@@ -484,16 +491,20 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
     }
 
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
-    match LlamaServer::launch(&gguf) {
+    match InferenceEngine::launch(&gguf) {
         Ok(server) => {
             if let Ok(mut g) = SERVER.lock() {
                 *g = Some((*model_id, Arc::new(server)));
             }
-            log::info!("SlmEngine: serving '{}' via llama-server (Vulkan)", spec.name);
+            log::info!(
+                "SlmEngine: serving '{}' via {} (Vulkan)",
+                spec.name,
+                if cfg!(feature = "inproc-llm") { "in-process llama.cpp" } else { "llama-server" }
+            );
             true
         }
         Err(e) => {
-            log::error!("SlmEngine: failed to start llama-server for '{}': {}", spec.name, e);
+            log::error!("SlmEngine: failed to start the inference engine for '{}': {}", spec.name, e);
             false
         }
     }
