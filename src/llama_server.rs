@@ -70,19 +70,29 @@ impl LlamaServer {
             )
         })?;
         info!("llama-server: launching {} (Vulkan, all layers on GPU) for {}", bin.display(), gguf_path);
-        let child = Command::new(&bin)
-            .args([
-                "-m",
-                gguf_path,
-                "-ngl",
-                "999", // offload every layer to the GPU via Vulkan
-                "--host",
-                HOST,
-                "--port",
-                &PORT.to_string(),
-                "-c",
-                &CTX_SIZE.to_string(),
-            ])
+        let mut cmd = Command::new(&bin);
+        cmd.args([
+            "-m",
+            gguf_path,
+            "-ngl",
+            "999", // offload every layer to the GPU via Vulkan
+            "--host",
+            HOST,
+            "--port",
+            &PORT.to_string(),
+            "-c",
+            &CTX_SIZE.to_string(),
+        ]);
+        // Multi-GPU rigs: pin inference to the one inference device. Left to itself, ggml's Vulkan
+        // backend layer-splits across every visible device — fighting the PoM/PoW workers mining on
+        // the other cards and dragging OPoI latency. GGML enumerates devices through the same
+        // Vulkan loader in the same order, so the raw index maps 1:1 (KERYX_INFER_GPU overrides).
+        if keryx_vulkan::enumerate_devices().len() > 1 {
+            let infer = keryx_vulkan::inference_device_index();
+            info!("llama-server: multi-GPU rig — pinning inference to Vulkan device {infer} (GGML_VK_VISIBLE_DEVICES)");
+            cmd.env("GGML_VK_VISIBLE_DEVICES", infer.to_string());
+        }
+        let child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

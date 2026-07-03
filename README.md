@@ -93,6 +93,16 @@ GGUF model files are downloaded on demand over IPFS on first run (same as upstre
 The miner is **GPU-only by default** (no CPU mining threads); pass `--threads N` (`-t`) to add CPU
 PoW workers if you want them.
 
+### Multi-GPU
+
+By default the miner spawns **one PoW/PoM worker per discrete Vulkan GPU** (the startup log prints
+the enumerated device list); restrict with `--gpu 0,2` (raw Vulkan device indices). Every mining
+GPU keeps its own resident copy of the same tier's weight blob, streamed straight from the GGUF on
+disk (no full-model host RAM copy — peak host overhead is a 256 MiB staging window). Inference
+(`llama-server`) is pinned to the first discrete GPU via `GGML_VK_VISIBLE_DEVICES` (override with
+`KERYX_INFER_GPU=N`); only the worker sharing that GPU pauses during OPoI challenges — the other
+cards keep mining.
+
 ### Solo vs pool
 
 `--keryxd-address` takes either a `grpc://` node (solo) or a `stratum+tcp://` pool URL. For pools:
@@ -122,6 +132,7 @@ PoW workers if you want them.
 | `KERYX_VULKAN_WORKLOAD` | nonces per PoW dispatch (default `1048576`) |
 | `KERYX_POW_ONLY` | `1` = mine kHeavyHash shares only; skip OPoI models + `llama-server` (no PoM) |
 | `KERYX_POM_KEEP_RESIDENT` | `1` = keep the PoM weight blob resident across inference when VRAM fits (skips reload) |
+| `KERYX_INFER_GPU` | raw Vulkan device index inference (llama-server) is pinned to on multi-GPU rigs (default: first discrete GPU) |
 | `GLSLC` / `VULKAN_SDK` | (build only) locate `glslc` for shader compilation |
 
 ---

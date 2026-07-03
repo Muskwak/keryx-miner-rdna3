@@ -113,6 +113,15 @@ pub struct Opt {
     pub num_threads: Option<u16>,
 
     #[clap(
+        long = "gpu",
+        help = "Comma-separated Vulkan device indices to mine on, e.g. --gpu 0,2 [default: all discrete GPUs]",
+        long_help = "Comma-separated raw Vulkan device indices to mine on (the startup log prints the \
+                     enumerated device list). Default: every discrete GPU. On multi-GPU rigs inference \
+                     (llama-server) is pinned to the first discrete GPU — override with KERYX_INFER_GPU."
+    )]
+    pub gpu: Option<String>,
+
+    #[clap(
         long = "mine-when-not-synced",
         help = "Mine even when keryxd says it is not synced",
         long_help = "Mine even when keryxd says it is not synced, only useful when passing `--allow-submit-block-when-not-synced` to keryxd  [default: false]"

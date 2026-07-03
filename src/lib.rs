@@ -141,6 +141,12 @@ pub trait Worker {
 
     fn get_workload(&self) -> usize;
     fn copy_output_to(&mut self, nonces: &mut Vec<u64>) -> Result<(), Error>;
+
+    /// Raw Vulkan device index this worker mines on, if it is a GPU worker. Keys the per-device
+    /// PoM miner registry (`pom_gpu`) and the inference-device pause on multi-GPU rigs.
+    fn device_index(&self) -> Option<u32> {
+        None
+    }
 }
 
 pub fn load_plugins<'help>(

@@ -30,8 +30,77 @@ pub fn probe_vram_mb() -> Option<u64> {
     Vk::new().ok().map(|vk| vk.device_local_vram_mb())
 }
 
+/// Total VRAM (MiB) of a specific Vulkan device (by raw enumeration index), or None if unusable.
+/// Multi-GPU: the model capability / PoM-residency gates size the INFERENCE device specifically,
+/// which need not be the device a given mining worker runs on.
+pub fn probe_vram_mb_for(index: usize) -> Option<u64> {
+    Vk::new_for_device(Some(index)).ok().map(|vk| vk.device_local_vram_mb())
+}
+
+/// One enumerated Vulkan physical device. `index` is the raw `vkEnumeratePhysicalDevices` position
+/// — the same order the loader reports to every Vulkan client in this process tree (including
+/// llama.cpp's `GGML_VK_VISIBLE_DEVICES`), so it is the stable cross-component device id.
+#[derive(Clone, Debug)]
+pub struct VkDeviceInfo {
+    pub index: usize,
+    pub name: String,
+    pub vram_mb: u64,
+    pub discrete: bool,
+}
+
+/// Enumerate all Vulkan physical devices (raw loader order). Empty if no loader/instance.
+pub fn enumerate_devices() -> Vec<VkDeviceInfo> {
+    unsafe {
+        let Ok(entry) = ash::Entry::load() else { return Vec::new() };
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(c"keryx-miner-rdna3")
+            .api_version(vk::make_api_version(0, 1, 3, 0));
+        let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+        let Ok(instance) = entry.create_instance(&create_info, None) else { return Vec::new() };
+        let devices = instance
+            .enumerate_physical_devices()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(index, &pd)| {
+                let props = instance.get_physical_device_properties(pd);
+                let mem = instance.get_physical_device_memory_properties(pd);
+                let heaps = &mem.memory_heaps[..mem.memory_heap_count as usize];
+                let vram_mb = heaps
+                    .iter()
+                    .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                    .map(|h| h.size)
+                    .max()
+                    .unwrap_or(0)
+                    / (1024 * 1024);
+                VkDeviceInfo {
+                    index,
+                    name: cstr_array_to_string(&props.device_name),
+                    vram_mb,
+                    discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
+                }
+            })
+            .collect();
+        instance.destroy_instance(None);
+        devices
+    }
+}
+
+/// The device inference (llama-server) runs on: `KERYX_INFER_GPU` override, else the first
+/// discrete GPU, else device 0. PoM blob eviction and the VRAM fit gate key off this index, and
+/// llama-server is pinned to it via `GGML_VK_VISIBLE_DEVICES` on multi-GPU rigs so inference
+/// never silently layer-splits across cards that are busy mining.
+pub fn inference_device_index() -> usize {
+    if let Some(idx) = std::env::var("KERYX_INFER_GPU").ok().and_then(|s| s.parse::<usize>().ok()) {
+        return idx;
+    }
+    let devices = enumerate_devices();
+    devices.iter().find(|d| d.discrete).map(|d| d.index).unwrap_or(0)
+}
+
 /// A ready-to-use compute device: instance, the chosen physical device, a logical device with a
-/// compute queue, and a command pool. One per process (the miner uses a single GPU).
+/// compute queue, and a command pool. One per (worker, kernel family) — on multi-GPU rigs each
+/// worker opens its own `Vk` bound to its device index.
 pub struct Vk {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -45,12 +114,19 @@ pub struct Vk {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     cmd_pool: vk::CommandPool,
     device_name: String,
+    device_index: usize,
 }
 
 impl Vk {
     /// Open a compute-capable Vulkan device, preferring a discrete GPU (the RDNA3 card). Enables
     /// `shaderInt64` — required by the PoM/PoW kernels' 64-bit folds.
     pub fn new() -> Result<Self, String> {
+        Self::new_for_device(None)
+    }
+
+    /// Open a specific Vulkan device by raw enumeration index (`None` = first DISCRETE_GPU, else
+    /// the first available — the historical single-GPU pick).
+    pub fn new_for_device(index: Option<usize>) -> Result<Self, String> {
         unsafe {
             let entry = ash::Entry::load().map_err(|e| format!("Vulkan loader (vulkan-1) not found: {e}"))?;
             let app_info = vk::ApplicationInfo::default()
@@ -61,7 +137,6 @@ impl Vk {
                 .create_instance(&create_info, None)
                 .map_err(|e| format!("create_instance failed: {e}"))?;
 
-            // Pick a physical device: first DISCRETE_GPU, else the first available.
             let pdevices = instance
                 .enumerate_physical_devices()
                 .map_err(|e| format!("enumerate_physical_devices: {e}"))?;
@@ -69,20 +144,39 @@ impl Vk {
                 instance.destroy_instance(None);
                 return Err("no Vulkan physical devices found".into());
             }
-            let mut pick: Option<(vk::PhysicalDevice, String, bool)> = None;
-            for pd in pdevices {
-                let props = instance.get_physical_device_properties(pd);
-                let name = cstr_array_to_string(&props.device_name);
-                let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
-                match &pick {
-                    None => pick = Some((pd, name, discrete)),
-                    Some((_, _, picked_discrete)) if !picked_discrete && discrete => {
-                        pick = Some((pd, name, discrete))
-                    }
-                    _ => {}
+            let pick = match index {
+                // Explicit device: raw enumeration index (matches `enumerate_devices`).
+                Some(i) => {
+                    let Some(&pd) = pdevices.get(i) else {
+                        instance.destroy_instance(None);
+                        return Err(format!(
+                            "Vulkan device index {i} out of range ({} device(s) present)",
+                            pdevices.len()
+                        ));
+                    };
+                    let props = instance.get_physical_device_properties(pd);
+                    (pd, cstr_array_to_string(&props.device_name), i)
                 }
-            }
-            let (pdevice, device_name, _) = pick.unwrap();
+                // Auto: first DISCRETE_GPU, else the first available.
+                None => {
+                    let mut pick: Option<(vk::PhysicalDevice, String, bool, usize)> = None;
+                    for (i, &pd) in pdevices.iter().enumerate() {
+                        let props = instance.get_physical_device_properties(pd);
+                        let name = cstr_array_to_string(&props.device_name);
+                        let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
+                        match &pick {
+                            None => pick = Some((pd, name, discrete, i)),
+                            Some((_, _, picked_discrete, _)) if !picked_discrete && discrete => {
+                                pick = Some((pd, name, discrete, i))
+                            }
+                            _ => {}
+                        }
+                    }
+                    let (pd, name, _, i) = pick.unwrap();
+                    (pd, name, i)
+                }
+            };
+            let (pdevice, device_name, device_index) = pick;
 
             // Find a queue family that supports COMPUTE.
             let qfams = instance.get_physical_device_queue_family_properties(pdevice);
@@ -133,6 +227,7 @@ impl Vk {
                 mem_props,
                 cmd_pool,
                 device_name,
+                device_index,
             })
         }
     }
@@ -140,6 +235,11 @@ impl Vk {
     /// Human-readable name of the selected GPU (e.g. "AMD Radeon RX 7900 XT").
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// Raw enumeration index of the selected GPU (stable id across workers/llama-server pinning).
+    pub fn device_index(&self) -> usize {
+        self.device_index
     }
 
     /// Total VRAM (MiB) = the largest `DEVICE_LOCAL` memory heap on the selected GPU. Taking the
@@ -248,7 +348,26 @@ impl Vk {
     /// data-dependent reads per nonce are ~100x faster from VRAM than from host-visible memory over
     /// PCIe — a host-visible blob made a single batch overrun the Windows TDR watchdog (DEVICE_LOST).
     pub fn create_device_local_address_buffer(&self, data: &[u8]) -> Result<(GpuBuffer, u64), String> {
-        let size = data.len() as u64;
+        self.create_device_local_address_buffer_streamed(data.len() as u64, &mut |offset, out| {
+            out.copy_from_slice(&data[offset as usize..offset as usize + out.len()]);
+            Ok(())
+        })
+    }
+
+    /// Staging window for [`create_device_local_address_buffer_streamed`]: 256 MiB bounds the
+    /// transient host-visible allocation regardless of blob size (a 1 GiB shard streams in 4 fills).
+    const STAGING_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// Like [`create_device_local_address_buffer`], but the contents are produced incrementally by
+    /// `fill(offset, window)` into a bounded staging window instead of being passed as one slice.
+    /// This is the zero-dup upload path: the caller streams bytes straight from the GGUF on disk,
+    /// so no full-blob host copy ever exists (peak host overhead = one 256 MiB staging window,
+    /// vs. the ~4.6 GiB packed `Vec` for the 8B tier — and ~25-40 GiB for the 32B/70B tiers).
+    pub fn create_device_local_address_buffer_streamed(
+        &self,
+        size: u64,
+        fill: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>,
+    ) -> Result<(GpuBuffer, u64), String> {
         assert!(size > 0, "zero-size buffer");
         unsafe {
             let max_alloc = self.max_memory_allocation_size();
@@ -279,9 +398,10 @@ impl Vk {
                 .map_err(|e| e.to_string())?;
             self.device.bind_buffer_memory(buffer, memory, 0).map_err(|e| e.to_string())?;
 
-            // Host-visible staging source: fill it, copy to VRAM, then free it.
+            // Bounded host-visible staging window, refilled and re-copied until the blob is up.
+            let stage_size = size.min(Self::STAGING_BYTES);
             let staging_info = vk::BufferCreateInfo::default()
-                .size(size)
+                .size(stage_size)
                 .usage(vk::BufferUsageFlags::TRANSFER_SRC)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let staging = self.device.create_buffer(&staging_info, None).map_err(|e| e.to_string())?;
@@ -297,15 +417,31 @@ impl Vk {
                     None,
                 )
                 .map_err(|e| e.to_string())?;
-            self.device.bind_buffer_memory(staging, smem, 0).map_err(|e| e.to_string())?;
-            let ptr = self
-                .device
-                .map_memory(smem, 0, size, vk::MemoryMapFlags::empty())
-                .map_err(|e| e.to_string())? as *mut u8;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-            self.device.unmap_memory(smem);
-
-            let copy_res = self.immediate_copy(staging, buffer, size);
+            let mut upload = || -> Result<(), String> {
+                self.device.bind_buffer_memory(staging, smem, 0).map_err(|e| e.to_string())?;
+                let ptr = self
+                    .device
+                    .map_memory(smem, 0, stage_size, vk::MemoryMapFlags::empty())
+                    .map_err(|e| e.to_string())? as *mut u8;
+                let mut done: u64 = 0;
+                let res = loop {
+                    if done == size {
+                        break Ok(());
+                    }
+                    let len = (size - done).min(stage_size);
+                    let window = std::slice::from_raw_parts_mut(ptr, len as usize);
+                    if let Err(e) = fill(done, window) {
+                        break Err(e);
+                    }
+                    if let Err(e) = self.immediate_copy_region(staging, buffer, len, done) {
+                        break Err(e);
+                    }
+                    done += len;
+                };
+                self.device.unmap_memory(smem);
+                res
+            };
+            let copy_res = upload();
             self.device.destroy_buffer(staging, None);
             self.device.free_memory(smem, None);
             if let Err(e) = copy_res {
@@ -329,8 +465,15 @@ impl Vk {
         limits11.max_memory_allocation_size
     }
 
-    /// Submit a one-shot buffer→buffer copy and block until it completes.
-    unsafe fn immediate_copy(&self, src: vk::Buffer, dst: vk::Buffer, size: u64) -> Result<(), String> {
+    /// Submit a one-shot buffer→buffer copy (`src[0..size]` → `dst[dst_offset..]`) and block until
+    /// it completes.
+    unsafe fn immediate_copy_region(
+        &self,
+        src: vk::Buffer,
+        dst: vk::Buffer,
+        size: u64,
+        dst_offset: u64,
+    ) -> Result<(), String> {
         let cmd = self
             .device
             .allocate_command_buffers(
@@ -348,7 +491,8 @@ impl Vk {
                     &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
                 .map_err(|e| e.to_string())?;
-            self.device.cmd_copy_buffer(cmd, src, dst, &[vk::BufferCopy::default().size(size)]);
+            self.device
+                .cmd_copy_buffer(cmd, src, dst, &[vk::BufferCopy::default().size(size).dst_offset(dst_offset)]);
             self.device.end_command_buffer(cmd).map_err(|e| e.to_string())?;
             let fence = self.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| e.to_string())?;
             let submit = vk::SubmitInfo::default().command_buffers(&cmds);

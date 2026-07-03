@@ -671,6 +671,46 @@ impl WeightIndex {
         arr
     }
 
+    /// Bulk read of canonical chunks `[first, first + out.len()/32)` into `out` (`out.len()` must
+    /// be a multiple of 32, the range in bounds). This is the zero-dup GPU upload source: the
+    /// Vulkan staging window is filled straight from the GGUF via positional reads, spanning
+    /// tensors through the same `(chunk_start, file_offset)` table `read_chunk` uses — so no
+    /// packed host copy of the blob is ever built. Positional reads keep it safe to call from
+    /// several GPU workers concurrently (multi-GPU installs share one `WeightIndex`).
+    pub fn read_chunk_range(&self, first: u64, out: &mut [u8]) -> std::io::Result<()> {
+        assert!(out.len() % 32 == 0, "read_chunk_range: length not chunk-aligned");
+        let n = out.len() as u64 / 32;
+        assert!(first + n <= self.n_chunks, "read_chunk_range: range past n_chunks");
+        match &self.chunks {
+            #[cfg(test)]
+            ChunkSource::Ram(data) => {
+                let base = (first as usize) * 32;
+                out.copy_from_slice(&data[base..base + out.len()]);
+                Ok(())
+            }
+            ChunkSource::Gguf { file, table } => {
+                let mut cur = first; // next canonical chunk to read
+                let mut filled = 0usize; // bytes of `out` already filled
+                let mut j = table.partition_point(|&(start, _)| start <= cur) - 1;
+                while filled < out.len() {
+                    let (t_start, t_file_off) = table[j];
+                    // This tensor's span ends where the next table entry starts (or at n_chunks).
+                    let t_end = table.get(j + 1).map(|&(s, _)| s).unwrap_or(self.n_chunks);
+                    let take = ((t_end - cur) * 32).min((out.len() - filled) as u64) as usize;
+                    read_exact_at(
+                        file,
+                        &mut out[filled..filled + take],
+                        t_file_off + (cur - t_start) * 32,
+                    )?;
+                    filled += take;
+                    cur += take as u64 / 32;
+                    j += 1;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Find the stored checkpoint at `level`, panics if not found.
     fn find_checkpoint(&self, level: u32) -> &StoredLevel {
         self.checkpoints.iter().find(|cp| cp.level == level).expect("PoM: checkpoint not found")
@@ -990,6 +1030,58 @@ mod tests {
             checkpoints,
             total_levels,
         }
+    }
+
+    /// `read_chunk_range` (the zero-dup GPU upload source) must return byte-identical data to the
+    /// per-chunk `read_chunk_bytes` path across tensor-span boundaries. Uses a synthetic GGUF-like
+    /// file: three "tensors" at padded (non-contiguous) file offsets, one with a ragged sub-chunk
+    /// tail that the canonical layout drops — the exact shapes the table walk must handle.
+    #[test]
+    fn read_chunk_range_matches_per_chunk_reads() {
+        let path = std::env::temp_dir().join(format!("keryx-pom-range-{}.bin", std::process::id()));
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&[0xAAu8; 100]); // fake header
+        let mut table: Vec<(u64, u64)> = Vec::new();
+        let mut n_chunks = 0u64;
+        // (full chunks, ragged tail bytes, pad bytes before the tensor)
+        for (full, ragged, pad) in [(5u64, 0usize, 3usize), (1, 20, 7), (3, 5, 1)] {
+            blob.extend_from_slice(&vec![0xEEu8; pad]);
+            table.push((n_chunks, blob.len() as u64));
+            for c in 0..full {
+                blob.extend_from_slice(&words_to_bytes(&synth_chunk(n_chunks + c)));
+            }
+            blob.extend_from_slice(&vec![0x55u8; ragged]); // dropped from the canonical layout
+            n_chunks += full;
+        }
+        std::fs::write(&path, &blob).unwrap();
+
+        let (checkpoints, total_levels) = compute_checkpoint_offsets(n_chunks);
+        let idx = WeightIndex {
+            n_chunks,
+            r_t: [0u8; 32],
+            chunks: ChunkSource::Gguf { file: File::open(&path).unwrap(), table },
+            tree_file: File::open(&path).unwrap(), // unused by chunk reads
+            tree_path: path.clone(),
+            checkpoints,
+            total_levels,
+        };
+
+        for first in 0..n_chunks {
+            for n in 1..=(n_chunks - first) {
+                let mut got = vec![0u8; (n * 32) as usize];
+                idx.read_chunk_range(first, &mut got).unwrap();
+                for c in 0..n {
+                    assert_eq!(
+                        &got[(c * 32) as usize..(c * 32 + 32) as usize],
+                        &idx.read_chunk_bytes(first + c),
+                        "range [{first}, +{n}) mismatch at chunk {}",
+                        first + c
+                    );
+                }
+            }
+        }
+        drop(idx);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Regression for the sparse-checkpoint R_T bug (commit e1811a0): the checkpoint-built root MUST

@@ -151,6 +151,52 @@ fn vulkan_pom_walk_matches_host_reference() {
     assert_eq!(gpu.mine(&[7u8; 32], 42, &[0xFFu8; 32], start, batch), Some(start));
 }
 
+/// The zero-dup streamed constructor MUST produce a blob byte-identical to the packed one: same
+/// winners for the same headers/targets, across a multi-shard layout (per-shard `source` offsets
+/// are the part the packed path never exercises).
+#[test]
+fn vulkan_pom_walk_streamed_matches_packed() {
+    let mut rng = StdRng::seed_from_u64(0x57EA_4ED5_7EA4);
+    let n_chunks: u64 = 257;
+    let words: Vec<u64> = (0..n_chunks * 4).map(|_| rng.r#gen::<u64>()).collect();
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+    // 64 chunks/shard → 5 shards; the source is called per staging window with chunk offsets.
+    let mut calls = 0u32;
+    let streamed = match PomWalkGpu::new_streamed_sharded(None, n_chunks, 64, &mut |first_chunk, out| {
+        calls += 1;
+        let base = (first_chunk * 32) as usize;
+        out.copy_from_slice(&bytes[base..base + out.len()]);
+        Ok(())
+    }) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: no Vulkan device available ({e})");
+            return;
+        }
+    };
+    assert!(calls >= 5, "streamed source called {calls} times, expected at least one per shard");
+    let packed = PomWalkGpu::new_sharded(&words, n_chunks, 64).expect("packed constructor");
+
+    let start: u64 = 0x1234_5678_9ABC_0000;
+    let batch: u32 = 4096;
+    for trial in 0..4 {
+        let mut pph = [0u8; 32];
+        rng.fill(&mut pph);
+        let ts: u64 = rng.r#gen();
+        let mut mid = [0u8; 32];
+        mid[31] = 0x40; // ~25% of nonces win → exercises real winner selection
+        for target in [[0u8; 32], mid, [0xFFu8; 32]] {
+            assert_eq!(
+                streamed.mine(&pph, ts, &target, start, batch),
+                packed.mine(&pph, ts, &target, start, batch),
+                "trial {trial}: streamed and packed blobs disagree (target msbyte {})",
+                target[31]
+            );
+        }
+    }
+}
+
 /// Same bit-exactness check, but force a MULTI-SHARD layout (tiny shards over a 257-chunk blob) so
 /// the shard-mapping path (shift/mask + per-shard device address) is exercised without multi-GiB
 /// allocations. The host reference reads the blob contiguously; the GPU must agree across shards.

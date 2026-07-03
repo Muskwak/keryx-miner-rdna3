@@ -139,12 +139,12 @@ fn check_gpu_vram_for_tier(needs_high: bool, needs_very_high: bool) {
     }
 }
 
-/// GPU 0 total VRAM (MB) via the Vulkan device the miner mines/serves on, or None when no
-/// usable Vulkan device is present. Memoized: the probe spins up a transient Vulkan device, so
-/// the result is cached across the two lineup capability-gate calls.
+/// Total VRAM (MB) of the INFERENCE Vulkan device (the one llama-server is pinned to on
+/// multi-GPU rigs), or None when no usable Vulkan device is present. Memoized: the probe spins up
+/// a transient Vulkan device, so the result is cached across the two lineup capability-gate calls.
 fn query_vram_mb() -> Option<u64> {
     static VRAM_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *VRAM_MB.get_or_init(keryx_vulkan::probe_vram_mb)
+    *VRAM_MB.get_or_init(|| keryx_vulkan::probe_vram_mb_for(keryx_vulkan::inference_device_index()))
 }
 
 /// OPoI capability gate (layer A): drop the models this machine cannot actually

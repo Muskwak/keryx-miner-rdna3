@@ -1,7 +1,12 @@
-//! In-process Vulkan PoW worker (RDNA3). Replaces the CUDA/OpenCL cdylib plugins: a [`Plugin`]
-//! that yields a single [`Worker`] driving the verified `keryx-vulkan` kHeavyHash kernel on the
-//! GPU. Registered directly into the [`PluginManager`](crate::PluginManager) by `main` — no shared
-//! library is loaded. The miner's existing GPU loop drives it through the `Worker` trait unchanged.
+//! In-process Vulkan PoW workers (RDNA3). Replaces the CUDA/OpenCL cdylib plugins: a [`Plugin`]
+//! that yields one [`Worker`] per mining GPU, each driving the verified `keryx-vulkan` kHeavyHash
+//! kernel on its own device. Registered directly into the [`PluginManager`](crate::PluginManager)
+//! by `main` — no shared library is loaded. The miner's existing GPU loop drives each worker
+//! through the `Worker` trait unchanged.
+//!
+//! Device selection: `--gpu 0,2` restricts mining to those raw Vulkan device indices (see the
+//! startup log for the enumerated list); the default is every discrete GPU, falling back to the
+//! historical single auto-picked device when none is discrete.
 
 use clap::ArgMatches;
 use keryx_vulkan::khh::{KhhGpu, MATRIX_LEN};
@@ -18,9 +23,11 @@ fn configured_workload() -> usize {
     std::env::var("KERYX_VULKAN_WORKLOAD").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(DEFAULT_WORKLOAD)
 }
 
-/// In-process plugin exposing the single RDNA3 GPU as one PoW worker.
+/// In-process plugin exposing each mining GPU as one PoW worker.
 pub struct VulkanPlugin {
     workload: usize,
+    /// Raw Vulkan device indices to mine on, resolved in `process_option`.
+    devices: Vec<usize>,
 }
 
 impl Default for VulkanPlugin {
@@ -31,7 +38,7 @@ impl Default for VulkanPlugin {
 
 impl VulkanPlugin {
     pub fn new() -> Self {
-        Self { workload: configured_workload() }
+        Self { workload: configured_workload(), devices: Vec::new() }
     }
 }
 
@@ -43,28 +50,83 @@ impl Plugin for VulkanPlugin {
         true
     }
     fn get_worker_specs(&self) -> Vec<Box<dyn WorkerSpec>> {
-        vec![Box::new(VulkanWorkerSpec { workload: self.workload })]
+        self.devices
+            .iter()
+            .map(|&device_index| {
+                Box::new(VulkanWorkerSpec { workload: self.workload, device_index }) as Box<dyn WorkerSpec>
+            })
+            .collect()
     }
-    fn process_option(&mut self, _matches: &ArgMatches) -> Result<usize, Error> {
-        info!("Vulkan PoW: 1 RDNA3 worker (workload {} nonces/dispatch)", self.workload);
-        Ok(1)
+    fn process_option(&mut self, matches: &ArgMatches) -> Result<usize, Error> {
+        let all = keryx_vulkan::enumerate_devices();
+        for d in &all {
+            info!(
+                "Vulkan device {}: {} ({} MiB VRAM{})",
+                d.index,
+                d.name,
+                d.vram_mb,
+                if d.discrete { ", discrete" } else { "" }
+            );
+        }
+
+        self.devices = match matches.value_of("gpu") {
+            // Explicit selection: comma-separated raw device indices.
+            Some(list) => {
+                let mut devices = Vec::new();
+                for part in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let idx: usize = part.parse().map_err(|_| format!("--gpu: '{part}' is not a device index"))?;
+                    if idx >= all.len() {
+                        return Err(format!("--gpu: device index {idx} out of range ({} device(s) present)", all.len()).into());
+                    }
+                    if !devices.contains(&idx) {
+                        devices.push(idx);
+                    }
+                }
+                if devices.is_empty() {
+                    return Err("--gpu: no device indices given".into());
+                }
+                devices
+            }
+            // Default: every discrete GPU; else the historical single auto pick (device 0-equivalent).
+            None => {
+                let discrete: Vec<usize> = all.iter().filter(|d| d.discrete).map(|d| d.index).collect();
+                if !discrete.is_empty() {
+                    discrete
+                } else if !all.is_empty() {
+                    vec![all[0].index]
+                } else {
+                    Vec::new() // no Vulkan device; the startup probe reports this separately
+                }
+            }
+        };
+
+        info!(
+            "Vulkan PoW: {} worker(s) on device(s) {:?} (workload {} nonces/dispatch)",
+            self.devices.len(),
+            self.devices,
+            self.workload
+        );
+        Ok(self.devices.len())
     }
 }
 
 pub struct VulkanWorkerSpec {
     workload: usize,
+    device_index: usize,
 }
 
 impl WorkerSpec for VulkanWorkerSpec {
     fn id(&self) -> String {
-        "Vulkan RDNA3".to_string()
+        format!("Vulkan #{}", self.device_index)
     }
     fn build(&self) -> Box<dyn Worker> {
-        Box::new(VulkanKhhWorker::new(self.workload).expect("Vulkan kHeavyHash worker init failed"))
+        Box::new(
+            VulkanKhhWorker::new(self.workload, self.device_index).expect("Vulkan kHeavyHash worker init failed"),
+        )
     }
 }
 
-/// kHeavyHash PoW worker backed by the `keryx-vulkan` GPU kernel.
+/// kHeavyHash PoW worker backed by the `keryx-vulkan` GPU kernel, bound to one device.
 pub struct VulkanKhhWorker {
     gpu: KhhGpu,
     workload: usize,
@@ -74,9 +136,9 @@ pub struct VulkanKhhWorker {
 }
 
 impl VulkanKhhWorker {
-    fn new(workload: usize) -> Result<Self, Error> {
-        let gpu = KhhGpu::new().map_err(|e| -> Error { e.into() })?;
-        let id = gpu.device_name().to_string();
+    fn new(workload: usize, device_index: usize) -> Result<Self, Error> {
+        let gpu = KhhGpu::new_for_device(Some(device_index)).map_err(|e| -> Error { e.into() })?;
+        let id = format!("#{} {}", device_index, gpu.device_name());
         info!("Vulkan kHeavyHash worker on: {}", id);
         Ok(Self { gpu, workload, nonce_cursor: thread_rng().next_u64(), last_winner: 0, id })
     }
@@ -122,5 +184,9 @@ impl Worker for VulkanKhhWorker {
     fn copy_output_to(&mut self, nonces: &mut Vec<u64>) -> Result<(), Error> {
         nonces[0] = self.last_winner;
         Ok(())
+    }
+
+    fn device_index(&self) -> Option<u32> {
+        Some(self.gpu.device_index() as u32)
     }
 }

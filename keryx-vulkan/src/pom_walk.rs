@@ -64,7 +64,7 @@ impl PomWalkGpu {
     /// Like [`new`](Self::new) but with an explicit shard size (chunks per shard, power of two).
     /// Lets tests force a multi-shard layout without multi-GiB allocations.
     pub fn new_sharded(weight_words: &[u64], n_chunks: u64, shard_chunks: u64) -> Result<Self, String> {
-        if n_chunks == 0 || weight_words.len() as u64 != n_chunks * 4 {
+        if weight_words.len() as u64 != n_chunks * 4 {
             return Err(format!(
                 "weight blob size mismatch: {} words for {} chunks (expected {})",
                 weight_words.len(),
@@ -72,10 +72,39 @@ impl PomWalkGpu {
                 n_chunks * 4
             ));
         }
+        Self::new_streamed_sharded(None, n_chunks, shard_chunks, &mut |first_chunk, out| {
+            let first_word = (first_chunk * 4) as usize;
+            out.copy_from_slice(&words_as_bytes(weight_words)[first_word * 8..first_word * 8 + out.len()]);
+            Ok(())
+        })
+    }
+
+    /// Zero-dup constructor: build the resident blob on `device_index` (`None` = the historical
+    /// auto pick) by pulling bytes through `source(first_chunk, out)` — `out` is always a multiple
+    /// of 32 B (whole chunks). The miner streams straight from the GGUF on disk, so the full packed
+    /// host blob (`Vec<u64>`, ~1x model size) never exists.
+    pub fn new_streamed(
+        device_index: Option<usize>,
+        n_chunks: u64,
+        source: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        Self::new_streamed_sharded(device_index, n_chunks, SHARD_CHUNKS, source)
+    }
+
+    /// [`new_streamed`](Self::new_streamed) with an explicit shard size, for multi-shard tests.
+    pub fn new_streamed_sharded(
+        device_index: Option<usize>,
+        n_chunks: u64,
+        shard_chunks: u64,
+        source: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        if n_chunks == 0 {
+            return Err("weight blob is empty (0 chunks)".into());
+        }
         if !shard_chunks.is_power_of_two() {
             return Err(format!("shard_chunks must be a power of two, got {shard_chunks}"));
         }
-        let vk = Vk::new()?;
+        let vk = Vk::new_for_device(device_index)?;
         let spirv = ash::util::read_spv(&mut Cursor::new(POM_WALK_SPV)).map_err(|e| e.to_string())?;
         // Two descriptor bindings: the winner buffer and the shard address table. The (large) weight
         // shards are reached by device address, not bound as descriptors.
@@ -86,12 +115,16 @@ impl PomWalkGpu {
         let mut shards: Vec<GpuBuffer> = Vec::with_capacity(n_shards as usize);
         let mut addrs: Vec<u64> = Vec::with_capacity(n_shards as usize);
         for s in 0..n_shards {
-            let first_word = (s * shard_chunks * 4) as usize;
-            let last_word = (((s + 1) * shard_chunks).min(n_chunks) * 4) as usize;
-            let slice = &weight_words[first_word..last_word];
+            let first_chunk = s * shard_chunks;
+            let shard_bytes = (((s + 1) * shard_chunks).min(n_chunks) - first_chunk) * 32;
             // Device-local VRAM (staged copy): the walk's random reads are ~100x faster here than
-            // host-visible memory — host-visible overran the TDR watchdog → DEVICE_LOST.
-            let (buf, addr) = vk.create_device_local_address_buffer(words_as_bytes(slice))?;
+            // host-visible memory — host-visible overran the TDR watchdog → DEVICE_LOST. The shard
+            // is filled through a bounded staging window; offsets are chunk-aligned by construction
+            // (the window size and shard size are both multiples of 32).
+            let (buf, addr) = vk.create_device_local_address_buffer_streamed(shard_bytes, &mut |off, out| {
+                debug_assert!(off % 32 == 0 && out.len() % 32 == 0);
+                source(first_chunk + off / 32, out)
+            })?;
             shards.push(buf);
             addrs.push(addr);
         }
@@ -107,6 +140,11 @@ impl PomWalkGpu {
     /// Name of the GPU the miner is running on.
     pub fn device_name(&self) -> &str {
         self.vk.device_name()
+    }
+
+    /// Raw enumeration index of the GPU the blob is resident on.
+    pub fn device_index(&self) -> usize {
+        self.vk.device_index()
     }
 
     pub fn n_chunks(&self) -> u64 {

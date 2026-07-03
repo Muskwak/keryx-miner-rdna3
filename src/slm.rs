@@ -444,7 +444,9 @@ fn pom_keep_resident(spec: &ModelSpec) -> bool {
         Some("0") | Some("false") => return false,
         _ => {}
     }
-    let Some(total_mb) = keryx_vulkan::probe_vram_mb() else {
+    // Size the INFERENCE device specifically: on multi-GPU rigs the served model and the blob
+    // only contend there (resident_blob_bytes() likewise reports that device's blob only).
+    let Some(total_mb) = keryx_vulkan::probe_vram_mb_for(keryx_vulkan::inference_device_index()) else {
         return false; // can't size the device → be safe, keep the unload
     };
     pom_fits(crate::pom_gpu::resident_blob_bytes(), spec.min_vram_mb, total_mb)
