@@ -59,11 +59,17 @@ jobs:
           cp start-miner.bat README.md "$asset/" 2>/dev/null || true
           7z a -tzip "$asset.zip" "$asset"
 
+      # cl.exe on PATH for the Ninja generator: the VS generator's vulkan-shaders-gen
+      # ExternalProject rule breaks (MSB8066); Ninja matches the locally-validated path.
+      - name: MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Build zero-dup (in-process llama.cpp variant)
         shell: bash
         env:
           # bindgen needs libclang; LLVM is preinstalled on windows runners.
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
+          CMAKE_GENERATOR: Ninja
         run: |
           cargo build --release --features zero-dup --bin keryx-miner
           asset="keryx-miner-${TAG}-win64-amd64-zerodup"
@@ -107,13 +113,21 @@ jobs:
           wget -qO- https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor -o /usr/share/keyrings/kitware.gpg
           echo "deb [signed-by=/usr/share/keyrings/kitware.gpg] https://apt.kitware.com/ubuntu/ focal main" > /etc/apt/sources.list.d/kitware.list
           apt-get update && apt-get install -y cmake
-          # glslc: the LunarG SDK tarball binaries are built on newer glibc and will not run in
-          # this container, so use LunarG's focal apt repo (its glslang is recent enough for
-          # GL_EXT_integer_dot_product / buffer_reference / int64 — everything our shaders use).
-          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | gpg --dearmor -o /usr/share/keyrings/lunarg.gpg
-          echo "deb [signed-by=/usr/share/keyrings/lunarg.gpg] https://packages.lunarg.com/vulkan focal main" > /etc/apt/sources.list.d/lunarg.list
-          apt-get update && apt-get install -y vulkan-sdk || apt-get install -y shaderc glslang-tools
-          glslc --version
+          # glslc: LunarG dropped the focal apt repo, and current SDK tarballs are built on
+          # newer glibc than this container — pin 1.3.268 (the last focal-era SDK; its glslang
+          # already knows GL_EXT_integer_dot_product / buffer_reference / int64, everything the
+          # keryx shaders use). VULKAN_SDK/PATH also let ggml's vulkan-shaders-gen find glslc.
+          ver=1.3.268.0
+          wget -qO /tmp/vulkansdk.tar.xz "https://sdk.lunarg.com/sdk/download/${ver}/linux/vulkansdk-linux-x86_64-${ver}.tar.xz"
+          mkdir -p /opt/vulkan-sdk
+          tar -xf /tmp/vulkansdk.tar.xz -C /opt/vulkan-sdk
+          glslc_bin="$(find /opt/vulkan-sdk -type f -name glslc | head -n1)"
+          test -n "$glslc_bin"
+          sdkroot="$(dirname "$(dirname "$glslc_bin")")"
+          echo "GLSLC=$glslc_bin" >> "$GITHUB_ENV"
+          echo "VULKAN_SDK=$sdkroot" >> "$GITHUB_ENV"
+          echo "$sdkroot/bin" >> "$GITHUB_PATH"
+          "$glslc_bin" --version
 
       - uses: actions/checkout@v7
 
