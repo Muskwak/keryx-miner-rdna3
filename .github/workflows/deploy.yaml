@@ -132,13 +132,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /usr/local/bin/glslc
-          key: glslc-shaderc-v2023.7-focal
+          key: glslc-shaderc-v2026.1-focal
 
       - name: Build glslc from source (cache miss)
         if: steps.cache-glslc.outputs.cache-hit != 'true'
+        env:
+          CC: gcc-10
+          CXX: g++-10
         run: |
           set -euxo pipefail
-          git clone --depth 1 --branch v2023.7 https://github.com/google/shaderc /tmp/shaderc
+          git clone --depth 1 --branch v2026.1 https://github.com/google/shaderc /tmp/shaderc
           cd /tmp/shaderc
           python3 ./utils/git-sync-deps
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
