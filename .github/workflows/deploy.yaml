@@ -155,6 +155,19 @@ jobs:
           echo "GLSLC=/usr/local/bin/glslc" >> "$GITHUB_ENV"
           /usr/local/bin/glslc --version
 
+      # ggml-vulkan compiles against modern Vulkan headers (focal's libvulkan-dev is 1.2-era)
+      # and its cmake hard-requires find_package(SPIRV-Headers CONFIG). Both are header-only
+      # Khronos repos — install pinned tags into /usr/local (find_path prefers it over /usr).
+      - name: Install Vulkan/SPIRV headers
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch v1.4.356 https://github.com/KhronosGroup/Vulkan-Headers /tmp/vk-headers
+          cmake -S /tmp/vk-headers -B /tmp/vk-headers/build
+          cmake --install /tmp/vk-headers/build
+          git clone --depth 1 --branch vulkan-sdk-1.4.350.1 https://github.com/KhronosGroup/SPIRV-Headers /tmp/spirv-headers
+          cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build
+          cmake --install /tmp/spirv-headers/build
+
       - name: Install Protoc
         uses: rustfs/setup-protoc@v3.0.1
         with:
