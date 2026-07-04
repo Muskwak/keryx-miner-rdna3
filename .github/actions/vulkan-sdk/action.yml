@@ -20,6 +20,13 @@ runs:
         glslc_bin="$(find "$HOME/vulkan-sdk" -type f -name glslc | head -n1)"
         test -n "$glslc_bin"
         echo "GLSLC=$glslc_bin" >> "$GITHUB_ENV"
+        # The in-process llama.cpp build (ggml-vulkan) also needs the SDK's modern Vulkan
+        # headers, its libvulkan for linking, and the SPIRV-Headers cmake config
+        # (find_package(SPIRV-Headers CONFIG REQUIRED)) — export the SDK root for cmake.
+        sdkroot="$(dirname "$(dirname "$glslc_bin")")"
+        echo "VULKAN_SDK=$sdkroot" >> "$GITHUB_ENV"
+        echo "CMAKE_PREFIX_PATH=$sdkroot" >> "$GITHUB_ENV"
+        echo "$sdkroot/bin" >> "$GITHUB_PATH"
         "$glslc_bin" --version
 
     - name: Install Vulkan SDK — Windows

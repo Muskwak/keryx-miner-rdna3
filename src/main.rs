@@ -139,12 +139,12 @@ fn check_gpu_vram_for_tier(needs_high: bool, needs_very_high: bool) {
     }
 }
 
-/// GPU 0 total VRAM (MB) via the Vulkan device the miner mines/serves on, or None when no
-/// usable Vulkan device is present. Memoized: the probe spins up a transient Vulkan device, so
-/// the result is cached across the two lineup capability-gate calls.
+/// Total VRAM (MB) of the INFERENCE Vulkan device (the one llama-server is pinned to on
+/// multi-GPU rigs), or None when no usable Vulkan device is present. Memoized: the probe spins up
+/// a transient Vulkan device, so the result is cached across the two lineup capability-gate calls.
 fn query_vram_mb() -> Option<u64> {
     static VRAM_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *VRAM_MB.get_or_init(keryx_vulkan::probe_vram_mb)
+    *VRAM_MB.get_or_init(|| keryx_vulkan::probe_vram_mb_for(keryx_vulkan::inference_device_index()))
 }
 
 /// OPoI capability gate (layer A): drop the models this machine cannot actually
@@ -488,11 +488,10 @@ async fn run() -> Result<(), Error> {
     // time PoM is active (DAA >= POM_ACTIVATION_DAA). Here we only record cheap config.
     if let Some(spec) = pom_spec {
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
-        // Force the single-device split loader so the mining tier exposes its quant tensors for
-        // zero-dup sharing, and record the mining MODEL so the walk can be built on demand. The PoM
-        // tier INDEX is computed per block from the block DAA (`pom_gpu::current_tier`), not frozen
-        // here — it reindexes at H2, so a startup-frozen value would be wrong post-fork.
-        keryx_miner::slm::set_pom_force_split(true);
+        // Record the mining MODEL so the walk can be built on demand (zero-dup: over the
+        // in-process engine's resident weights on the inference GPU). The PoM tier INDEX is
+        // computed per block from the block DAA (`pom_gpu::current_tier`), not frozen here —
+        // it reindexes at H2, so a startup-frozen value would be wrong post-fork.
         keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
         info!("PoM: configured to mine {} under possession; index + GPU walk load lazily when PoM activates (DAA {}).",
             spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
@@ -506,11 +505,6 @@ async fn run() -> Result<(), Error> {
         Ok(keryx_miner::slm::GpuProbe::NoDevice) => {
             error!("No Vulkan device detected — OPoI inference and GPU mining require a Vulkan GPU (RDNA3). Cannot mine.");
             return Err("No Vulkan device — cannot start OPoI mining".into());
-        }
-        Ok(keryx_miner::slm::GpuProbe::NoServer) => {
-            error!("Vulkan GPU found but llama-server is missing. Download the prebuilt llama.cpp Vulkan");
-            error!("release and place llama-server[.exe] in '<miner_dir>/llama/' (or set KERYX_LLAMA_SERVER).");
-            return Err("llama-server (Vulkan) not found — cannot serve OPoI inference".into());
         }
         Err(e) => {
             error!("Inference probe task panicked: {}", e);

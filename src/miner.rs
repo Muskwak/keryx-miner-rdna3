@@ -283,6 +283,10 @@ impl MinerManager {
                 // above kernel-launch overhead (batch ≈ 43 ms at 24 MH/s).
                 let mut pom_nonce: u64 = thread_rng().next_u64();
                 const POM_BATCH: u64 = 1 << 20;
+                // This worker's Vulkan device: keys its resident PoM blob, and decides whether it
+                // shares the GPU with inference (only that worker pauses during OPoI challenges).
+                let pom_device = gpu_work.device_index().unwrap_or(0);
+                let on_inference_gpu = pom_device == keryx_vulkan::inference_device_index() as u32;
 
                 loop {
                     nonces[0] = 0;
@@ -303,14 +307,16 @@ impl MinerManager {
                     // over the resident weights instead of kHeavyHash. On a winning nonce we build
                     // the proof (host) and submit; the legacy plugin path below is skipped.
                     if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
-                        // Inference owns the GPU while a challenge runs (it has priority). Pause the
+                        // Inference owns ITS GPU while a challenge runs (it has priority). Pause the
                         // walk instead of dispatching: two Vulkan contexts sharing one compute queue
                         // would slow inference past its OPoI deadline, and contention can stretch a
                         // walk dispatch past the Windows TDR watchdog (~2 s) → DEVICE_LOST. When VRAM
                         // allows, the blob stays resident across the pause (see slm::ensure_loaded) so
                         // mining resumes with no reload; otherwise it was unloaded and the
                         // is_installed() check below rebuilds it once the challenge clears.
-                        if opoi_challenge_active.load(Ordering::Relaxed) {
+                        // Workers on OTHER devices keep mining — llama-server is pinned to the
+                        // inference GPU, so they never contend with it.
+                        if on_inference_gpu && opoi_challenge_active.load(Ordering::Relaxed) {
                             std::thread::sleep(Duration::from_millis(100));
                             if let Some(cmd) = block_channel.get_changed()? {
                                 state = match cmd {
@@ -332,10 +338,11 @@ impl MinerManager {
                         // Rebuild the walk (reloads the model resident) before mining resumes.
                         // Thread the live DAA so the host index computes the correct PoM tier (H2
                         // 5-tier vs pre-H2 4-tier) — see ensure_installed doc.
-                        if !keryx_miner::pom_gpu::is_installed() {
-                            keryx_miner::pom_gpu::ensure_installed(daa);
+                        if !keryx_miner::pom_gpu::is_installed(pom_device) {
+                            keryx_miner::pom_gpu::ensure_installed(daa, pom_device);
                         }
-                        let found = keryx_miner::pom_gpu::mine(&pph, time, &target_le, pom_nonce, POM_BATCH);
+                        let found =
+                            keryx_miner::pom_gpu::mine(pom_device, &pph, time, &target_le, pom_nonce, POM_BATCH);
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);

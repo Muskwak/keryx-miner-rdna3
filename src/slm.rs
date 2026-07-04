@@ -1,14 +1,15 @@
-//! Phase-3 OPoI inference — served by a prebuilt llama.cpp **Vulkan** `llama-server` (RDNA3).
+//! Phase-3 OPoI inference — llama.cpp **Vulkan**, in-process (RDNA3).
 //!
-//! Models are downloaded on demand (GGUF over IPFS) and served by a `llama-server` child process
-//! with full GPU offload (`-ngl 999`) over localhost HTTP. Mining pauses during inference. There
-//! is no in-process LLM engine and no CUDA/CPU inference: all of it runs on the GPU via Vulkan.
+//! Models are downloaded on demand (GGUF over IPFS) and served by the in-process engine
+//! (`llm_engine.rs`, all layers on the GPU). The PoM walk shares the engine's resident weight
+//! buffers on the inference GPU (zero-dup). Mining pauses on that GPU during inference. No
+//! external llama-server child, no CUDA, no CPU inference: everything runs on the GPU via Vulkan.
 use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::llama_server::LlamaServer;
+use crate::llm_engine::LlamaEngine as InferenceEngine;
 use crate::models::{ModelFormat, ModelSpec};
 
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
@@ -66,11 +67,7 @@ static LINEUP_V2: RwLock<&'static [&'static ModelSpec]> = RwLock::new(&[]);
 static V2_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// The single resident llama-server, keyed by the model it serves. `Arc` so an in-flight request
 /// can outlive an eviction (server is killed when the last `Arc` drops).
-static SERVER: Mutex<Option<([u8; 32], Arc<LlamaServer>)>> = Mutex::new(None);
-
-/// No-op in the RDNA3 fork: the Vulkan PoM miner loads its own weight blob (there is no candle
-/// zero-dup tensor sharing across the llama-server process boundary). Kept so `main` compiles.
-pub fn set_pom_force_split(_enabled: bool) {}
+static SERVER: Mutex<Option<([u8; 32], Arc<InferenceEngine>)>> = Mutex::new(None);
 
 // ── File management ──────────────────────────────────────────────────────────
 
@@ -294,6 +291,14 @@ pub fn set_v2_lineup(specs: &'static [&'static ModelSpec]) {
     *LINEUP_V2.write().unwrap() = specs;
 }
 
+/// Zero-dup: the resident in-process engine currently serving `model_id`, if any. The shared
+/// PoM walk holds this Arc for as long as it walks the engine's weight buffers, so the model
+/// cannot be freed underneath an in-flight dispatch.
+pub fn active_engine(model_id: &[u8; 32]) -> Option<Arc<InferenceEngine>> {
+    let g = SERVER.lock().ok()?;
+    g.as_ref().filter(|(id, _)| id == model_id).map(|(_, e)| Arc::clone(e))
+}
+
 /// Drop the running llama-server so the next inference relaunches from the current lineup.
 pub fn evict_engine() {
     match SERVER.lock() {
@@ -352,24 +357,19 @@ pub fn advance_lineup_if_due(daa: u64) {
 
 /// Outcome of the startup inference probe.
 pub enum GpuProbe {
-    /// A Vulkan device is present and the llama-server binary is available — inference is ready.
+    /// A Vulkan device is present — the engine is linked in-process, so inference is ready.
     Ok,
     /// No usable Vulkan device — GPU inference (and PoM/PoW) cannot run on this host.
     NoDevice,
-    /// A Vulkan device exists but the llama-server binary was not found.
-    NoServer,
 }
 
-/// Verify the inference backend before mining: a Vulkan device + the llama-server binary.
+/// Verify the inference backend before mining. The engine is linked into the miner, so only
+/// the Vulkan device needs probing.
 pub fn probe_gpu_inference() -> GpuProbe {
     match keryx_vulkan::probe_device() {
         Some(name) => {
             log::info!("Vulkan inference device: {}", name);
-            if crate::llama_server::binary_available() {
-                GpuProbe::Ok
-            } else {
-                GpuProbe::NoServer
-            }
+            GpuProbe::Ok
         }
         None => GpuProbe::NoDevice,
     }
@@ -444,7 +444,9 @@ fn pom_keep_resident(spec: &ModelSpec) -> bool {
         Some("0") | Some("false") => return false,
         _ => {}
     }
-    let Some(total_mb) = keryx_vulkan::probe_vram_mb() else {
+    // Size the INFERENCE device specifically: on multi-GPU rigs the served model and the blob
+    // only contend there (resident_blob_bytes() likewise reports that device's blob only).
+    let Some(total_mb) = keryx_vulkan::probe_vram_mb_for(keryx_vulkan::inference_device_index()) else {
         return false; // can't size the device → be safe, keep the unload
     };
     pom_fits(crate::pom_gpu::resident_blob_bytes(), spec.min_vram_mb, total_mb)
@@ -482,16 +484,16 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
     }
 
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
-    match LlamaServer::launch(&gguf) {
+    match InferenceEngine::launch(&gguf) {
         Ok(server) => {
             if let Ok(mut g) = SERVER.lock() {
                 *g = Some((*model_id, Arc::new(server)));
             }
-            log::info!("SlmEngine: serving '{}' via llama-server (Vulkan)", spec.name);
+            log::info!("SlmEngine: serving '{}' via in-process llama.cpp (Vulkan)", spec.name);
             true
         }
         Err(e) => {
-            log::error!("SlmEngine: failed to start llama-server for '{}': {}", spec.name, e);
+            log::error!("SlmEngine: failed to start the inference engine for '{}': {}", spec.name, e);
             false
         }
     }

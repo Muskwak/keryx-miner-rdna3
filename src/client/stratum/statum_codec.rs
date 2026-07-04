@@ -2,25 +2,58 @@ use bytes::BytesMut;
 use log::error;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use serde_repr::*;
 use std::fmt::{Display, Formatter};
 use std::{fmt, io};
 use tokio_util::codec::{Decoder, Encoder, LinesCodec};
 
-#[derive(Serialize_repr, Deserialize_repr, Debug, Clone)]
-#[repr(u8)]
+// Every code a pool can send MUST deserialize: a failure here rejects the whole line, tearing
+// down the connection and triggering a reconnect loop on every rejection. Known codes are from
+// stratum-spec v1.1 §error-codes (26/27 are the Keryx OPoI/PoM extension); anything else —
+// including negative JSON-RPC codes like -32601 — lands in Other.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(from = "i64", into = "i64")]
 pub enum ErrorCode {
-    Unknown = 20,
-    JobNotFound = 21,
-    DuplicateShare = 22,
-    LowDifficultyShare = 23,
-    Unauthorized = 24,
-    NotSubscribed = 25,
-    // Keryx OPoI/PoM extension (stratum-spec v1.1 §error-codes). These MUST be representable:
-    // a missing variant makes serde_repr fail to deserialize the whole line, tearing down the
-    // connection and triggering a reconnect loop on every tag/proof rejection.
-    InvalidOpoiTag = 26,
-    InvalidPomProof = 27,
+    Unknown,
+    JobNotFound,
+    DuplicateShare,
+    LowDifficultyShare,
+    Unauthorized,
+    NotSubscribed,
+    InvalidOpoiTag,
+    InvalidPomProof,
+    Other(i64),
+}
+
+impl From<i64> for ErrorCode {
+    fn from(code: i64) -> Self {
+        match code {
+            20 => ErrorCode::Unknown,
+            21 => ErrorCode::JobNotFound,
+            22 => ErrorCode::DuplicateShare,
+            23 => ErrorCode::LowDifficultyShare,
+            24 => ErrorCode::Unauthorized,
+            25 => ErrorCode::NotSubscribed,
+            26 => ErrorCode::InvalidOpoiTag,
+            27 => ErrorCode::InvalidPomProof,
+            other => ErrorCode::Other(other),
+        }
+    }
+}
+
+impl From<ErrorCode> for i64 {
+    fn from(code: ErrorCode) -> Self {
+        match code {
+            ErrorCode::Unknown => 20,
+            ErrorCode::JobNotFound => 21,
+            ErrorCode::DuplicateShare => 22,
+            ErrorCode::LowDifficultyShare => 23,
+            ErrorCode::Unauthorized => 24,
+            ErrorCode::NotSubscribed => 25,
+            ErrorCode::InvalidOpoiTag => 26,
+            ErrorCode::InvalidPomProof => 27,
+            ErrorCode::Other(other) => other,
+        }
+    }
 }
 
 impl Display for ErrorCode {
@@ -34,12 +67,41 @@ impl Display for ErrorCode {
             ErrorCode::NotSubscribed => write!(f, "NotSubscribed"),
             ErrorCode::InvalidOpoiTag => write!(f, "InvalidOpoiTag"),
             ErrorCode::InvalidPomProof => write!(f, "InvalidPomProof"),
+            ErrorCode::Other(code) => write!(f, "Other({})", code),
         }
     }
 }
 
+// Pools send errors in two wire shapes: classic stratum arrays `[code, message, data?]` and
+// JSON-RPC 2.0 objects `{"code":..,"message":..,"data":..}`. Both must parse — see ErrorCode
+// above for why a parse failure here is fatal to the connection. Serialization stays array-form.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct StratumError(pub(crate) ErrorCode, pub(crate) String, #[serde(default)] pub(crate) Option<Value>);
+#[serde(from = "StratumErrorRepr")]
+pub(crate) struct StratumError(pub(crate) ErrorCode, pub(crate) String, pub(crate) Option<Value>);
+
+#[derive(Deserialize)]
+struct StratumErrorTuple(ErrorCode, String, #[serde(default)] Option<Value>);
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StratumErrorRepr {
+    Tuple(StratumErrorTuple),
+    Object {
+        code: ErrorCode,
+        message: String,
+        #[serde(default)]
+        data: Option<Value>,
+    },
+}
+
+impl From<StratumErrorRepr> for StratumError {
+    fn from(repr: StratumErrorRepr) -> Self {
+        match repr {
+            StratumErrorRepr::Tuple(StratumErrorTuple(code, message, data)) => StratumError(code, message, data),
+            StratumErrorRepr::Object { code, message, data } => StratumError(code, message, data),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
@@ -214,5 +276,50 @@ impl Encoder<StratumLine> for NewLineJsonCodec {
 impl Default for NewLineJsonCodec {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_error(line: &str) -> StratumError {
+        let parsed: StratumLine = serde_json::from_str(line).unwrap_or_else(|e| panic!("failed to parse {line}: {e}"));
+        parsed.error.expect("line should carry an error")
+    }
+
+    #[test]
+    fn error_as_array() {
+        let err = parse_error(r#"{"id":1,"result":null,"error":[23,"Low difficulty share",null]}"#);
+        assert_eq!(err.0, ErrorCode::LowDifficultyShare);
+        assert_eq!(err.1, "Low difficulty share");
+    }
+
+    #[test]
+    fn error_as_two_element_array() {
+        let err = parse_error(r#"{"id":1,"result":null,"error":[21,"Job not found"]}"#);
+        assert_eq!(err.0, ErrorCode::JobNotFound);
+        assert!(err.2.is_none());
+    }
+
+    #[test]
+    fn error_as_object() {
+        let err = parse_error(r#"{"id":422,"result":null,"error":{"code":25,"message":"Not subscribed"}}"#);
+        assert_eq!(err.0, ErrorCode::NotSubscribed);
+        assert_eq!(err.1, "Not subscribed");
+    }
+
+    #[test]
+    fn unknown_and_negative_codes_do_not_fail() {
+        let err = parse_error(r#"{"id":1,"result":null,"error":[30,"Banned"]}"#);
+        assert_eq!(err.0, ErrorCode::Other(30));
+        let err = parse_error(r#"{"id":1,"result":null,"error":{"code":-32601,"message":"Method not found"}}"#);
+        assert_eq!(err.0, ErrorCode::Other(-32601));
+    }
+
+    #[test]
+    fn error_serializes_as_array() {
+        let json = serde_json::to_string(&StratumError(ErrorCode::NotSubscribed, "Not subscribed".into(), None)).unwrap();
+        assert_eq!(json, r#"[25,"Not subscribed",null]"#);
     }
 }

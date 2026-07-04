@@ -40,7 +40,13 @@ pub struct KhhGpu {
 
 impl KhhGpu {
     pub fn new() -> Result<Self, String> {
-        let vk = Vk::new()?;
+        Self::new_for_device(None)
+    }
+
+    /// Open the PoW kernel on a specific Vulkan device (`None` = historical auto pick) so each
+    /// multi-GPU worker grinds on its own card.
+    pub fn new_for_device(device_index: Option<usize>) -> Result<Self, String> {
+        let vk = Vk::new_for_device(device_index)?;
         let spirv = ash::util::read_spv(&mut Cursor::new(KHH_SPV)).map_err(|e| e.to_string())?;
         let kernel = vk.make_kernel(&spirv, 2, std::mem::size_of::<KhhPush>() as u32)?;
         let matrix = vk.create_buffer((MATRIX_PACKED_LEN * 4) as u64)?;
@@ -50,6 +56,11 @@ impl KhhGpu {
 
     pub fn device_name(&self) -> &str {
         self.vk.device_name()
+    }
+
+    /// Raw enumeration index of the GPU this PoW kernel runs on.
+    pub fn device_index(&self) -> usize {
+        self.vk.device_index()
     }
 
     /// Load a block's constants: the 64x64 4-bit matrix (row-major), the 72-byte pow header as 9

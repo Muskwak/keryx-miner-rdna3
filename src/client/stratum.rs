@@ -676,6 +676,11 @@ impl StratumHandler {
                         error!("Got error code {}: {}", code, error);
                         Err(error.into())
                     }
+                    // Pool-specific/unrecognized code — treat as a rejected share, never fatal.
+                    ErrorCode::Other(_) => {
+                        warn!("Share rejected with unrecognized error code {} (Job id: {:?}): {}", code, jobid, error);
+                        Ok(())
+                    }
                 }
             }
             _ => Err(format!("Unhandled stratum response: {:?}", msg).into()),
