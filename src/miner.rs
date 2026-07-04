@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use crate::{pow, watch, Error};
@@ -178,7 +178,7 @@ impl MinerManager {
         let logger_hashes = Arc::clone(&hashes_tried);
         let logger_by_worker = hashes_by_worker.clone();
         let logger_challenge = Arc::clone(&opoi_challenge_active);
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             Self::log_hashrate(logger_hashes, logger_by_worker, logger_challenge, logger_stop_spawn)
         });
         Self {
@@ -351,9 +351,9 @@ impl MinerManager {
                             // index reindexing at H2 is applied at the exact boundary — else the node
                             // rejects the proof (BadWeightPath).
                             let built = state.as_ref().and_then(|s| {
-                                let (idx, _) = keryx_miner::pom::active_index()?;
-                                let tier = keryx_miner::pom_gpu::current_tier(s.daa_score)?;
-                                s.generate_block_if_pom(nonce, idx, tier)
+                                let tier = keryx_miner::pom_gpu::current_tier(pom_device, s.daa_score)?;
+                                let idx = keryx_miner::pom::active_index_for_tier(tier)?;
+                                s.generate_block_if_pom(nonce, idx.as_ref(), tier)
                             });
                             if let Some(block_seed) = built {
                                 match send_channel.blocking_send(block_seed.clone()) {
@@ -508,9 +508,10 @@ impl MinerManager {
                     // recomputed from this block's DAA (per-block, not the frozen build-time tier) so
                     // the H2 reindex is applied at the boundary — else the node rejects (BadWeightPath).
                     let found = if state_ref.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA {
-                        keryx_miner::pom::active_index().and_then(|(idx, _)| {
-                            let tier = keryx_miner::pom_gpu::current_tier(state_ref.daa_score)?;
-                            state_ref.generate_block_if_pom(nonce.0, idx, tier)
+                        // The CPU/fallback walk has no per-device tier assignment — mine whichever
+                        // tier's index is built (lowest present).
+                        keryx_miner::pom::any_active_index().and_then(|(tier, idx)| {
+                            state_ref.generate_block_if_pom(nonce.0, idx.as_ref(), tier)
                         })
                     } else {
                         state_ref.generate_block_if_pow(nonce.0)

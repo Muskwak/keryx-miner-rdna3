@@ -8,6 +8,12 @@ use crate::proto::{
     NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
 };
 use crate::{miner::MinerManager, Error};
+
+/// Max AiRequest queue size — drop oldest when full to prevent unbounded memory growth.
+const MAX_AI_QUEUE_SIZE: usize = 64;
+/// Max unique stable-ids tracked for deduplication — evict when full.
+const MAX_AI_SEEN_IDS: usize = 10_000;
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use log::{error, info, warn};

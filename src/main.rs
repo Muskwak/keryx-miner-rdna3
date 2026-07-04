@@ -183,6 +183,95 @@ fn filter_specs_by_vram(
     }
 }
 
+/// Per-tier VRAM floor (MB) for **auto-assignment** — the practical minimum to load that tier's
+/// model (Q4 weights + KV cache + Vulkan workspace). Distinct from `ModelSpec.min_vram_mb`, which is
+/// 0 for the smallest tiers (never gated out of `ai:cap`) and so can't rank tier 0 vs 1 by VRAM.
+/// Largest tier first, so a device picks the biggest tier it can hold.
+const POM_TIER_LADDER: &[(keryx_miner::models::Tier, u64)] = &[
+    (keryx_miner::models::Tier::VeryHigh, 30_000),
+    (keryx_miner::models::Tier::High, 24_000),
+    (keryx_miner::models::Tier::Default, 8_000),
+    (keryx_miner::models::Tier::Light, 5_000),
+    (keryx_miner::models::Tier::VeryLight, 2_000),
+];
+
+/// Ordinal rank of a tier (VeryLight=0 … VeryHigh=4), for the "≤ ceiling" comparison.
+fn tier_rank(t: keryx_miner::models::Tier) -> u8 {
+    use keryx_miner::models::Tier::*;
+    match t {
+        VeryLight => 0,
+        Light => 1,
+        Default => 2,
+        High => 3,
+        VeryHigh => 4,
+    }
+}
+
+/// Assign each Vulkan device the highest PoM tier that (a) is ≤ the `ceiling` flag and (b) fits its
+/// VRAM — so a heterogeneous rig mines a different tier per GPU instead of the lowest common
+/// denominator, small cards downgrade instead of failing, and big cards are not pushed past the
+/// user's ceiling. Ported from the CUDA fork's `query_all_gpus_vram` (nvidia-smi/cudarc) to
+/// `keryx_vulkan::enumerate_devices`, which already exists here for the inference-device pick —
+/// `device_id`s are the same raw Vulkan enumeration index the walk loads onto. Empty when PoM is
+/// disabled on this network; a single device-0 entry (highest tier ≤ ceiling) when no Vulkan
+/// device is enumerated, so the fallback walk still has a tier.
+fn assign_pom_tiers(ceiling: keryx_miner::models::Tier) -> Vec<(u32, &'static keryx_miner::models::ModelSpec)> {
+    if keryx_miner::pom::POM_ACTIVATION_DAA == u64::MAX {
+        return Vec::new(); // PoM disabled on this network — serve only, don't mine possession.
+    }
+    let ceiling_rank = tier_rank(ceiling);
+    // PoM model + assignment floor for each tier ≤ ceiling, largest first.
+    let candidates: Vec<(u64, &'static keryx_miner::models::ModelSpec)> = POM_TIER_LADDER
+        .iter()
+        .filter(|(t, _)| tier_rank(*t) <= ceiling_rank)
+        .filter_map(|(t, floor)| {
+            keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, *t)
+                .iter()
+                .copied()
+                .find(|s| keryx_miner::models::is_pom_model(&s.model_id))
+                .map(|s| (*floor, s))
+        })
+        .collect();
+
+    let pick = |vram_mb: u64| -> Option<&'static keryx_miner::models::ModelSpec> {
+        candidates.iter().copied().find(|(floor, _)| *floor <= vram_mb).map(|(_, s)| s)
+    };
+
+    let devices = keryx_vulkan::enumerate_devices();
+    if devices.is_empty() {
+        log::warn!("No Vulkan device enumerated for PoM tier assignment — assigning the ceiling tier to device 0 (fallback).");
+        return candidates.first().map(|(_, s)| vec![(0u32, *s)]).unwrap_or_default();
+    }
+    let mut out = Vec::with_capacity(devices.len());
+    for d in devices {
+        match pick(d.vram_mb) {
+            Some(spec) => out.push((d.index as u32, spec)),
+            None => log::warn!("PoM: GPU {} ({} MB VRAM) fits no tier ≤ the ceiling — it will not mine PoM.", d.index, d.vram_mb),
+        }
+    }
+    out
+}
+
+/// The served lineup (drives `ai:cap` + prefetch) = the distinct models across all GPU assignments.
+/// Falls back to the `ceiling` tier's model when nothing was assigned (PoM disabled, or every GPU too
+/// small), so `ai:cap`/inference still have a lineup.
+fn lineup_from_assignments(
+    assignments: &[(u32, &'static keryx_miner::models::ModelSpec)],
+    ceiling: keryx_miner::models::Tier,
+) -> &'static [&'static keryx_miner::models::ModelSpec] {
+    let mut union: Vec<&'static keryx_miner::models::ModelSpec> = Vec::new();
+    for (_, spec) in assignments {
+        if !union.iter().any(|s| s.model_id == spec.model_id) {
+            union.push(*spec);
+        }
+    }
+    if union.is_empty() {
+        return keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, ceiling);
+    }
+    // Leaked once at startup to keep the &'static API of init_supported / prefetch.
+    Box::leak(union.into_boxed_slice())
+}
+
 async fn get_client(
     keryxd_address: String,
     mining_address: String,
@@ -436,27 +525,25 @@ async fn run() -> Result<(), Error> {
         keryx_miner::models::Tier::Default
     };
     // Post-fork: OPoI-v2 (DAA 37,780,000) and H2 (DAA 38,951,445) are both in the past, so the
-    // legacy lineup (daa < opoi_v2) is dead — no fresh miner is ever pre-fork again. Stage,
-    // announce, and prefetch ONLY the uncensored post-H2 lineup, filtered by hardware capability.
-    // Stage the FINAL (post-H2) lineup directly — `specs_for(VERY_LIGHT_ACTIVATION_DAA, ..)` returns
-    // the latest model for the tier. For light/default/high this is identical to the OPoI-v2 model
-    // (unchanged at H2); for `--very-light` it stages Qwen3-1.7B and for `--very-high` the Q2_K_L.
-    // The chain relaunches directly into H2, so the post-H2 model is the one that must be resident.
-    let specs_v2 = filter_specs_by_vram(
-        keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, tier),
-    );
-    // PoM: pick the highest tier this miner serves that has a pinned R_T (the model it will
-    // mine under possession). Captured before `specs_v2` is consumed; the index is built after
-    // prefetch (below). `&'static ModelSpec` is Copy so this survives the moves.
-    let pom_spec = if keryx_miner::pom::POM_ACTIVATION_DAA != u64::MAX {
-        specs_v2
-            .iter()
-            .copied()
-            .filter(|s| keryx_miner::models::is_pom_model(&s.model_id))
-            .max_by_key(|s| s.min_vram_mb)
-    } else {
-        None
-    };
+    // legacy lineup (daa < opoi_v2) is dead — no fresh miner is ever pre-fork again. Stage the
+    // FINAL lineup (post-H2) directly — `specs_for(VERY_LIGHT_ACTIVATION_DAA, ..)` always returns
+    // the latest models for the tier. We deliberately do NOT also download the pre-H2 model for a
+    // tier whose model changes at H2: the old `--very-high` 70B Q4_K_M is served by nobody
+    // (48 GB-only), so a 5090 miner just pulls the new Q2_K_L straight away instead of paying two
+    // ~27 GB downloads + a hot-swap. A tier whose post-H2 model isn't consensus-valid yet
+    // (very-light, very-high) simply produces no block until H2 (its `pom_tier_index` is None
+    // pre-H2) — it idles, no wasted bandwidth.
+    // Per-GPU PoM assignment: each Vulkan device mines the highest tier ≤ the flag ceiling that its
+    // VRAM holds (small cards downgrade instead of failing; big cards are not pushed past the
+    // ceiling). device_ids are the raw Vulkan enumeration index the walk loads onto.
+    let pom_assignments = assign_pom_tiers(tier);
+    // The served lineup (ai:cap + prefetch) = the union of distinct models across all GPUs,
+    // filtered by the inference device's hardware capability. Note: a mining-only GPU can be
+    // assigned a tier too large for the (single, separate) inference device to serve — that tier
+    // is still mined per-device (pom_assignments), but won't appear in specs_v2/be downloaded, so
+    // that device's ensure_installed_inner just idles on the missing `.ok` sentinel rather than
+    // erroring. Edge case on a heterogeneous rig; not expected in the common single/matched-GPU case.
+    let specs_v2 = filter_specs_by_vram(lineup_from_assignments(&pom_assignments, tier));
     // Announce the uncensored lineup from the start. set_v2_lineup keeps the readiness-gated
     // crossing swap a consistent no-op (it would swap v2 -> v2).
     keryx_miner::slm::set_v2_lineup(specs_v2);
@@ -486,15 +573,17 @@ async fn run() -> Result<(), Error> {
     // pre-PoM legacy phase the GPU + host stay free for the legacy lineup (mining + inference start
     // immediately). The possession index AND the GPU walk are built by the mining loop the first
     // time PoM is active (DAA >= POM_ACTIVATION_DAA). Here we only record cheap config.
-    if let Some(spec) = pom_spec {
-        let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
-        // Record the mining MODEL so the walk can be built on demand (zero-dup: over the
-        // in-process engine's resident weights on the inference GPU). The PoM tier INDEX is
-        // computed per block from the block DAA (`pom_gpu::current_tier`), not frozen here —
-        // it reindexes at H2, so a startup-frozen value would be wrong post-fork.
-        keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
-        info!("PoM: configured to mine {} under possession; index + GPU walk load lazily when PoM activates (DAA {}).",
-            spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
+    if !pom_assignments.is_empty() {
+        // Record each GPU's mining MODEL so its walk can be built on demand (zero-dup: over the
+        // in-process engine's resident weights, on whichever device is the inference device). The
+        // PoM tier INDEX is computed per block from the block DAA (`pom_gpu::current_tier`), not
+        // frozen here — it reindexes at H2, so a startup-frozen value would be wrong post-fork.
+        for (device_id, spec) in &pom_assignments {
+            let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+            keryx_miner::pom_gpu::set_mining_tier(*device_id, spec.model_id, gpath);
+            info!("PoM: GPU {} → {} (index + GPU walk load lazily when PoM activates, DAA {}).",
+                device_id, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
+        }
     }
 
     // Verify the Vulkan inference backend before mining. OPoI challenges are mandatory, so a miner

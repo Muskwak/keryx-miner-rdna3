@@ -1,20 +1,23 @@
-//! Proof-of-Model GPU mining — **Vulkan** backend (RDNA3). Replaces the old CUDA `pom_mine` PTX
-//! path. Streams the mining tier's GGUF quant bytes into per-GPU Vulkan storage buffers using the
-//! canonical name-sorted, 32-byte-chunk layout (identical to [`crate::pom::WeightIndex`]), then
-//! drives the verified `keryx_vulkan` PoM walk kernel to find a winning nonce. The host
-//! `WeightIndex` is also built so a winning nonce can be turned into a `PomProof`
-//! (`State::generate_block_if_pom`).
+//! Proof-of-Model GPU mining — **Vulkan** backend (RDNA3). Streams the mining tier's GGUF quant
+//! bytes into per-GPU Vulkan storage buffers using the canonical name-sorted, 32-byte-chunk layout
+//! (identical to [`crate::pom::WeightIndex`]), then drives the verified `keryx_vulkan` PoM walk
+//! kernel to find a winning nonce. The host `WeightIndex` is also built so a winning nonce can be
+//! turned into a `PomProof` (`State::generate_block_if_pom`).
 //!
 //! Zero-dup load path: the VRAM blob is filled straight from the GGUF on disk through the
 //! `WeightIndex` chunk table (bounded 256 MiB staging window) — the packed full-model host `Vec`
 //! the old loader built (~4.6 GiB for the 8B tier, ~25-40 GiB for 32B/70B) no longer exists.
-//! Multi-GPU: one resident blob per mining device, keyed by the raw Vulkan device index; every
-//! device mines the same tier over the one shared host index.
+//!
+//! Multi-GPU, heterogeneous tiers: each mining device can hold a DIFFERENT tier (the highest its
+//! VRAM fits — see main.rs's `assign_pom_tiers`), matching Keryx-Labs upstream's per-GPU design,
+//! ported here from CUDA to Vulkan. `MINING_TIERS` keys the assignment by device; the host
+//! possession index (`pom::active_index_for_tier`) is keyed by tier instead, so two GPUs mining
+//! the SAME tier share one index build.
 //!
 //! The seed/walk/pow folds are byte-identical across the GPU kernel, `pom.rs`, and the node, so a
 //! nonce found here builds a proof the node accepts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -40,7 +43,7 @@ impl Resident {
     fn mine(&self, pph: &[u8; 32], ts: u64, target: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
         match self {
             Resident::Blob(m) => m.mine(pph, ts, target, start, batch),
-                    Resident::Shared { walk, .. } => walk.mine(pph, ts, target, start, batch),
+            Resident::Shared { walk, .. } => walk.mine(pph, ts, target, start, batch),
         }
     }
 
@@ -49,7 +52,7 @@ impl Resident {
     fn extra_vram_bytes(&self) -> u64 {
         match self {
             Resident::Blob(m) => m.n_chunks() * 32,
-                    Resident::Shared { .. } => 0,
+            Resident::Shared { .. } => 0,
         }
     }
 }
@@ -60,20 +63,14 @@ impl Resident {
 /// other's batches.
 static MINERS: Mutex<Option<HashMap<u32, Resident>>> = Mutex::new(None);
 
-/// Mining-tier identity for (re)builds: (model_id, gguf_path). Set once at startup.
-static MINING_TIER: OnceLock<([u8; 32], String)> = OnceLock::new();
-
-/// Number of in-flight one-time index/blob loads (workers intentionally paused, not stalled).
-static LOADING: AtomicUsize = AtomicUsize::new(0);
-
-/// Record the mining tier so the miner can build its index + GPU weight blob on first PoM activation.
-pub fn set_mining_tier(model_id: [u8; 32], gguf_path: String) {
-    let _ = MINING_TIER.set((model_id, gguf_path));
-}
-
-/// Whether a PoM index/blob load is in progress on any device (worker intentionally paused).
-pub fn is_loading() -> bool {
-    LOADING.load(Ordering::Relaxed) > 0
+/// Guards the one-time-per-tier host index build. Workers on multiple devices mining the SAME tier
+/// may race into PoM activation together, but the heavy GGUF -> WeightIndex build must happen
+/// exactly once per tier. One lock shared across all tiers (not per-tier) — a rare simultaneous
+/// first-build of two DIFFERENT tiers on a heterogeneous rig serializes, which only costs a little
+/// extra startup latency, not correctness.
+fn index_build_lock() -> &'static Mutex<()> {
+    static INDEX_BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    INDEX_BUILD_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 /// Whether the GPU PoM miner is resident and ready on `device`.
@@ -123,15 +120,106 @@ pub fn mine(
     m.mine(pre_pow_hash, timestamp, target_le, start, batch)
 }
 
+/// Number of in-flight one-time index/blob loads (workers intentionally paused, not stalled).
+static LOADING: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a PoM index/blob load is in progress on any device (worker intentionally paused).
+pub fn is_loading() -> bool {
+    LOADING.load(Ordering::Relaxed) > 0
+}
+
+/// Per-GPU mining-tier identity for rebuilds: `device_id -> (model_id, gguf_path)`. A heterogeneous
+/// rig mines a different tier per GPU (the highest its VRAM holds — see main.rs's
+/// `assign_pom_tiers`), so this is keyed by device rather than a single process-wide tier.
+static MINING_TIERS: OnceLock<Mutex<HashMap<u32, ([u8; 32], String)>>> = OnceLock::new();
+
+fn mining_tiers() -> &'static Mutex<HashMap<u32, ([u8; 32], String)>> {
+    MINING_TIERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record a GPU's mining tier so its miner can be rebuilt after an inference swapped the model away.
+pub fn set_mining_tier(device_id: u32, model_id: [u8; 32], gguf_path: String) {
+    if let Ok(mut g) = mining_tiers().lock() {
+        g.insert(device_id, (model_id, gguf_path));
+    }
+}
+
+/// PoM tier index of a device's mining model at a given block DAA. Recomputed per block (not
+/// frozen at index-build time) so the tier reindexing at the very-light hardfork (H2) is applied
+/// at the exact boundary — e.g. Gemma 0→1 — rather than from a stale build-time value. The proof's
+/// `tier` field MUST come from here, keyed on the block's own DAA, or a post-H2 block carries the
+/// stale 4-tier index and the node rejects it (`BadWeightPath`).
+pub fn current_tier(device_id: u32, daa: u64) -> Option<u8> {
+    let model_id = mining_tiers().lock().ok()?.get(&device_id).map(|(id, _)| *id)?;
+    crate::models::pom_tier_index(&model_id, daa)
+}
+
+/// The device that mines `model_id` (from the per-GPU tier assignment), if any. Inference for a
+/// model is routed to the device that already holds it, so only that GPU pauses mining and the
+/// walk can share the resident weights (zero-dup). Returns the lowest matching `device_id` when
+/// several GPUs mine the same tier; `None` when no GPU is assigned this model.
+pub fn device_for_model(model_id: &[u8; 32]) -> Option<u32> {
+    let g = mining_tiers().lock().ok()?;
+    g.iter().filter(|(_, (id, _))| id == model_id).map(|(dev, _)| *dev).min()
+}
+
+/// Models that OOM'd when loading on a given GPU: `(device_id, model_id)`. Once banlisted, that GPU
+/// never retries that model (avoids a hot-spin reloading a model that doesn't fit); the OOM handler
+/// downgrades the GPU to a smaller downloaded tier instead.
+static OOM_BANLIST: OnceLock<Mutex<HashSet<(u32, [u8; 32])>>> = OnceLock::new();
+
+fn oom_banlist() -> &'static Mutex<HashSet<(u32, [u8; 32])>> {
+    OOM_BANLIST.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn is_oom_banlisted(device_id: u32, model_id: &[u8; 32]) -> bool {
+    oom_banlist().lock().map(|g| g.contains(&(device_id, *model_id))).unwrap_or(false)
+}
+
+fn oom_banlist_add(device_id: u32, model_id: [u8; 32]) {
+    if let Ok(mut g) = oom_banlist().lock() {
+        g.insert((device_id, model_id));
+    }
+}
+
+/// After a GPU fails to load its assigned tier (allocation failure), reassign it to the largest
+/// **already-downloaded** PoM model strictly smaller than the failed one that hasn't itself been
+/// banlisted on this GPU — so a card whose VRAM estimate was optimistic (driver overhead +
+/// fragmentation) mines a smaller tier instead of idling. Returns true if a downgrade was applied.
+/// No extra prefetch is needed: the candidate set is the served union (a mixed rig already
+/// downloaded the smaller tiers).
+fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> bool {
+    let Some(failed_tier) = crate::models::pom_tier_index(failed_model, daa) else {
+        return false;
+    };
+    let pick = crate::slm::served_pom_specs()
+        .into_iter()
+        .filter_map(|s| crate::models::pom_tier_index(&s.model_id, daa).map(|t| (t, s)))
+        .filter(|(t, s)| *t < failed_tier && !is_oom_banlisted(device_id, &s.model_id))
+        .max_by_key(|(t, _)| *t);
+    match pick {
+        Some((tier, spec)) => {
+            let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+            info!("PoM[gpu{}]: allocation failure on tier {} — downgrading to tier {} ({}).", device_id, failed_tier, tier, spec.name);
+            set_mining_tier(device_id, spec.model_id, gguf);
+            true
+        }
+        None => {
+            log::warn!("PoM[gpu{}]: allocation failure and no smaller downloaded tier available — this GPU will not mine PoM.", device_id);
+            false
+        }
+    }
+}
+
 /// Ensure the GPU PoM miner is installed on `device`; build the host possession index (first
-/// activation, shared across devices) and stream the weight blob into that device's VRAM if
-/// needed. Returns true when ready to mine.
+/// activation for that tier, shared across every GPU mining it) and stream the weight blob into
+/// that device's VRAM if needed. Returns true when ready to mine.
 ///
-/// `daa` MUST be the current block's live DAA score — the host index's tier byte is baked into
-/// `pom::POM_INDEX` (a `OnceLock`) on first build and reused for every proof afterwards, so if
-/// this is called with a stale/wrong DAA at startup the miner declares the wrong tier for the
-/// rest of the process's life (BadWeightPath / "block invalid" on every submission, exactly like
-/// the pre-H2/post-H2 tier-index regression on the CUDA fork).
+/// `daa` MUST be the current block's live DAA score — the per-tier index's tier byte is baked in
+/// on first build and reused for every proof afterwards, so if this is called with a stale/wrong
+/// DAA at startup the miner declares the wrong tier for the rest of the process's life
+/// (BadWeightPath / "block invalid" on every submission, exactly like the pre-H2/post-H2
+/// tier-index regression on the CUDA fork).
 pub fn ensure_installed(daa: u64, device: u32) -> bool {
     if is_installed(device) {
         return true;
@@ -142,85 +230,81 @@ pub fn ensure_installed(daa: u64, device: u32) -> bool {
     ok
 }
 
-
-/// PoM tier index of the mining model at a given block DAA. Recomputed per block (not frozen at
-/// index-build time) so the tier reindexing at the very-light hardfork (H2) is applied at the
-/// exact boundary — e.g. Gemma 0→1 — rather than from a stale build-time value. The proof's `tier`
-/// field MUST come from here, keyed on the block's own DAA, or a post-H2 block carries the stale
-/// 4-tier index and the node rejects it (`BadWeightPath`).
-pub fn current_tier(daa: u64) -> Option<u8> {
-    let (model_id, _) = MINING_TIER.get()?;
-    crate::models::pom_tier_index(model_id, daa)
-}
-
 fn ensure_installed_inner(daa: u64, device: u32) -> bool {
-    let (model_id, gguf) = match MINING_TIER.get() {
+    let (model_id, gguf) = match mining_tiers().lock().ok().and_then(|g| g.get(&device).cloned()) {
         Some(x) => x,
         None => return false,
     };
+    // This GPU's tier at the current block DAA (recomputed per block, H2-gated).
+    let tier = match crate::models::pom_tier_index(&model_id, daa) {
+        Some(t) => t,
+        None => return false,
+    };
+    if is_oom_banlisted(device, &model_id) {
+        return false; // this model OOM'd on this GPU before — don't retry (avoids a hot reload spin).
+    }
 
-    // Build the host possession index once (heavy: hashes every chunk to a disk Merkle tree).
-    // Needed to construct the PoM proof for a winning nonce, and it doubles as the zero-dup
+    // Build THIS tier's possession index once (host, heavy) — deferred from boot so the pre-PoM
+    // legacy phase starts immediately, and keyed by tier so a mixed rig builds one index per
+    // distinct tier it mines (shared across every GPU on that tier). Also doubles as the zero-dup
     // GPU upload source (its chunk table maps canonical chunks to GGUF file offsets).
-    if crate::pom::active_index().is_none() {
-        // Build-time tier is used only for logging + the get_or_build_index/set_index bookkeeping;
-        // the tier EMITTED in each proof is recomputed per block via `current_tier(daa)`. `daa` here
-        // is the block DAA at first activation (>= POM_ACTIVATION_DAA, guaranteed by the caller).
-        let tier = match crate::models::pom_tier_index(model_id, daa) {
-            Some(t) => t,
-            None => return false,
+    if crate::pom::active_index_for_tier(tier).is_none() {
+        let _guard = match index_build_lock().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
         };
-
-        // Defer the heavy index build until the mining-tier GGUF is fully downloaded. The `.ok`
-        // sentinel sits next to model.gguf (written by slm after a verified download). Building from
-        // a partial GGUF fails with a confusing partial-read/ENOENT; returning false here just lets
-        // the mining loop retry on its next tick once the download lands. Checked via the GGUF's own
-        // directory rather than slm's SUPPORTED_SPECS, which holds the legacy (v1) lineup until the
-        // post-fork swap and would not list this v2 mining model.
-        let model_ready = std::path::Path::new(gguf)
-            .parent()
-            .map(|d| d.join(".ok").exists())
-            .unwrap_or(false);
-        if !model_ready {
-            info!("PoM: mining-tier model not fully downloaded yet (.ok absent) — deferring index build.");
-            return false;
-        }
-
-        // Serialize the one-time host index build across PoM workers. Harmless for a single worker,
-        // but required once >1 worker exists (multi-GPU): get_or_build_index makes exactly one
-        // build. The closure also enforces the consensus-pinned (R_T, N) for this tier — a
-        // wrong-quant / corrupt / truncated GGUF is rejected HERE, once, instead of silently
-        // producing PoM blocks every one of which the node rejects with BadWeightPath.
-        let gguf_path = gguf.clone();
-        let expected = crate::models::pinned_pom_anchor(model_id);
-        if !crate::pom::get_or_build_index(tier, move || {
-            let idx = crate::pom::WeightIndex::build_from_gguf(&gguf_path)?;
-            if let Some(anchor) = expected {
-                if idx.n_chunks != anchor.chunks {
-                    return Err(candle_core::Error::Msg(format!(
-                        "PoM: index chunk count {} != consensus-pinned {} — wrong/corrupt GGUF for this tier; \
-                         refusing to mine (every block would be rejected)",
-                        idx.n_chunks, anchor.chunks
-                    )));
-                }
-                if idx.r_t != anchor.root {
-                    return Err(candle_core::Error::Msg(format!(
-                        "PoM: computed R_T {} != consensus-pinned root for this tier — wrong/corrupt GGUF; \
-                         refusing to mine (every block would be rejected)",
-                        hex32(&idx.r_t)
-                    )));
-                }
-                info!("PoM: index R_T + N match the consensus-pinned anchor for tier {}.", tier);
-            } else {
-                log::warn!("PoM: no consensus-pinned anchor for this model_id — skipping the R_T/N check.");
+        if crate::pom::active_index_for_tier(tier).is_none() {
+            // Defer the heavy index build until the mining-tier GGUF is fully downloaded. The `.ok`
+            // sentinel sits next to model.gguf (written by slm after a verified download). Building
+            // from a partial GGUF fails with a confusing partial-read/ENOENT; returning false here
+            // just lets the mining loop retry on its next tick once the download lands.
+            let model_ready = std::path::Path::new(&gguf)
+                .parent()
+                .map(|d| d.join(".ok").exists())
+                .unwrap_or(false);
+            if !model_ready {
+                info!("PoM: tier {} model not fully downloaded yet (.ok absent) — deferring index build.", tier);
+                return false;
             }
-            Ok(idx)
-        }) {
-            return false;
+
+            info!("PoM: building host weight index for tier {} (gpu{}) — this can take a while…", tier, device);
+            // Enforces the consensus-pinned (R_T, N) for this tier — a wrong-quant / corrupt /
+            // truncated GGUF is rejected HERE, once, instead of silently producing PoM blocks
+            // every one of which the node rejects with BadWeightPath.
+            let expected = crate::models::pinned_pom_anchor(&model_id);
+            match crate::pom::WeightIndex::build_from_gguf(&gguf) {
+                Ok(idx) => {
+                    if let Some(anchor) = expected {
+                        if idx.n_chunks != anchor.chunks {
+                            log::error!(
+                                "PoM: index chunk count {} != consensus-pinned {} for tier {} — wrong/corrupt GGUF; refusing to mine",
+                                idx.n_chunks, anchor.chunks, tier
+                            );
+                            return false;
+                        }
+                        if idx.r_t != anchor.root {
+                            log::error!(
+                                "PoM: computed R_T {} != consensus-pinned root for tier {} — wrong/corrupt GGUF; refusing to mine",
+                                hex32(&idx.r_t), tier
+                            );
+                            return false;
+                        }
+                        info!("PoM: index R_T + N match the consensus-pinned anchor for tier {}.", tier);
+                    } else {
+                        log::warn!("PoM: no consensus-pinned anchor for this model_id — skipping the R_T/N check.");
+                    }
+                    info!("PoM: tier {} host index ready — N={} chunks", tier, idx.n_chunks);
+                    crate::pom::set_index(tier, idx);
+                }
+                Err(e) => {
+                    log::error!("PoM: host index build failed for tier {}: {}", tier, e);
+                    return false;
+                }
+            }
         }
     }
 
-    let (idx, _) = match crate::pom::active_index() {
+    let idx = match crate::pom::active_index_for_tier(tier) {
         Some(x) => x,
         None => return false,
     };
@@ -229,7 +313,7 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
     // buffers — 0 extra VRAM — instead of installing a second copy. Any failure falls back
     // to the streamed blob below (correct, just costs the duplicate VRAM).
     if device == keryx_vulkan::inference_device_index() as u32 {
-        match install_shared(idx, model_id) {
+        match install_shared(&idx, &model_id) {
             Ok(entry) => {
                 if let Ok(mut g) = MINERS.lock() {
                     g.get_or_insert_with(HashMap::new).insert(device, entry);
@@ -243,15 +327,21 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
     }
 
     // Stream the canonical weight blob from the GGUF straight into this device's VRAM through the
-    // index's chunk table — no packed host copy (the old `load_weight_words` Vec was ~1x model
-    // size). The blob N equals the index N by construction (same table), so the proof-vs-blob
-    // N-guard the packed loader needed is structural here.
+    // index's chunk table — no packed host copy. The blob N equals the index N by construction
+    // (same table), so the proof-vs-blob N-guard the packed loader needed is structural here. A
+    // load failure surfaces as an Err or, on some Vulkan drivers, a panic; catch both so the OOM
+    // handler can banlist + downgrade instead of crashing the mining thread or hot-spinning on a
+    // model that doesn't fit this GPU.
     info!("PoM(vulkan): streaming weight blob into VRAM on device {}…", device);
-    let mut source = |first_chunk: u64, out: &mut [u8]| {
-        idx.read_chunk_range(first_chunk, out).map_err(|e| format!("GGUF chunk stream failed: {e}"))
-    };
-    match PomWalkGpu::new_streamed(Some(device as usize), idx.n_chunks, &mut source) {
-        Ok(gpu) => {
+    let idx_for_stream = idx.clone();
+    let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut source = |first_chunk: u64, out: &mut [u8]| {
+            idx_for_stream.read_chunk_range(first_chunk, out).map_err(|e| format!("GGUF chunk stream failed: {e}"))
+        };
+        PomWalkGpu::new_streamed(Some(device as usize), idx_for_stream.n_chunks, &mut source)
+    }));
+    match loaded {
+        Ok(Ok(gpu)) => {
             info!(
                 "PoM(vulkan): GPU miner ready on {} (device {}) — N={} chunks resident",
                 gpu.device_name(),
@@ -263,8 +353,16 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
             }
             true
         }
-        Err(e) => {
-            log::error!("PoM(vulkan): GPU miner init failed on device {}: {}", device, e);
+        Ok(Err(e)) => {
+            log::error!("PoM(vulkan)[gpu{}]: device miner build failed: {} — banlisting this model and downgrading.", device, e);
+            oom_banlist_add(device, model_id);
+            downgrade_after_oom(device, &model_id, daa);
+            false
+        }
+        Err(_) => {
+            log::error!("PoM(vulkan)[gpu{}]: device miner load panicked (likely an allocation failure) — banlisting this model and downgrading.", device);
+            oom_banlist_add(device, model_id);
+            downgrade_after_oom(device, &model_id, daa);
             false
         }
     }
@@ -275,7 +373,7 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
 /// canonical name-sorted order, hard N equality, plus a random chunk sample fetched through the
 /// GPU table and compared byte-for-byte against the GGUF-backed index — a mismatch would mean
 /// every mined block gets rejected, so it aborts the shared path entirely.
-fn install_shared(idx: &'static crate::pom::WeightIndex, model_id: &[u8; 32]) -> Result<Resident, String> {
+fn install_shared(idx: &crate::pom::WeightIndex, model_id: &[u8; 32]) -> Result<Resident, String> {
     // The engine must be serving the MINING model (post-PoM: serving == mining tier). This
     // loads it resident on the inference GPU if it is not already.
     if !crate::slm::ensure_loaded(model_id) {

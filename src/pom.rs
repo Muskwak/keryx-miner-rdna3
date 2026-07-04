@@ -37,7 +37,8 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
         return Ok(());
     }
 }
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const CHUNK_WORDS: usize = 4; // 32 B chunk
 const SEED_SALT: u64 = 0x4B65727978500; // "KeryxP"
@@ -915,57 +916,31 @@ fn finalize_checkpoint_upper(
 /// MAINNET_PARAMS.pom_activation = new(37_780_000).
 pub const POM_ACTIVATION_DAA: u64 = 37_780_000;
 
-/// The resident tier weight index + tier id, installed once at startup when PoM is enabled.
-static POM_INDEX: OnceLock<(WeightIndex, u8)> = OnceLock::new();
+/// Per-tier resident possession indices, built lazily when PoM activates. A heterogeneous rig can
+/// mine several tiers at once (one per GPU), so the index is keyed by tier rather than a single
+/// process-wide slot. Each tier's index is built once and shared (`Arc`) across every GPU on it.
+static POM_INDICES: OnceLock<Mutex<HashMap<u8, Arc<WeightIndex>>>> = OnceLock::new();
 
-/// Install the possession index (built from the resident model) and its tier. Call once.
-pub fn set_index(index: WeightIndex, tier: u8) {
-    let _ = POM_INDEX.set((index, tier));
+fn pom_indices() -> &'static Mutex<HashMap<u8, Arc<WeightIndex>>> {
+    POM_INDICES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The active possession index + tier, if installed.
-pub fn active_index() -> Option<&'static (WeightIndex, u8)> {
-    POM_INDEX.get()
+/// Install a tier's possession index (built from that tier's resident model). Idempotent per tier.
+pub fn set_index(tier: u8, index: WeightIndex) {
+    if let Ok(mut g) = pom_indices().lock() {
+        g.insert(tier, Arc::new(index));
+    }
 }
 
-/// Guards the one-time possession-index build. Every PoM GPU worker races into activation at the
-/// same DAA, but `WeightIndex::build_from_gguf` writes a single Merkle tree (`pom-tree.bin`) next to
-/// the GGUF, so two threads building concurrently clobber the same file — the "failed to fill whole
-/// buffer" startup failure seen on multi-GPU rigs. Harmless on a single worker; only bites once >1
-/// PoM worker exists (multi-GPU, or a GPU + a future CPU worker).
-static INDEX_BUILD_LOCK: Mutex<()> = Mutex::new(());
+/// The possession index for a specific tier, if built.
+pub fn active_index_for_tier(tier: u8) -> Option<Arc<WeightIndex>> {
+    pom_indices().lock().ok().and_then(|g| g.get(&tier).cloned())
+}
 
-/// Build + install the possession index exactly once across racing workers. Returns true when the
-/// index is ready (already installed, or built here). `build` runs only on the single thread that
-/// wins the lock with the index still absent; the others wait, then observe it installed.
-///
-/// Double-checked: the cheap `active_index()` read short-circuits the common case (index already
-/// built) without taking the lock; the second check under the lock closes the race window.
-pub fn get_or_build_index<F>(tier: u8, build: F) -> bool
-where
-    F: FnOnce() -> candle_core::Result<WeightIndex>,
-{
-    if active_index().is_some() {
-        return true;
-    }
-    // A poisoned lock just means a prior builder panicked; the guard's data is `()`, so recover it
-    // and proceed — the double-check below still keeps the build single.
-    let _guard = INDEX_BUILD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    if active_index().is_some() {
-        return true;
-    }
-    log::info!("PoM: building possession index (first PoM activation) — this can take a while…");
-    match build() {
-        Ok(idx) => {
-            log::info!("PoM: weight index ready — N={} chunks", idx.n_chunks);
-            set_index(idx, tier);
-            true
-        }
-        Err(e) => {
-            log::error!("PoM: index build failed: {e}");
-            false
-        }
-    }
+/// Any built index — the lowest tier present. Used by the CPU/fallback walk, which has no per-device
+/// tier assignment, and by "is any index ready" checks.
+pub fn any_active_index() -> Option<(u8, Arc<WeightIndex>)> {
+    pom_indices().lock().ok().and_then(|g| g.iter().min_by_key(|(t, _)| **t).map(|(t, i)| (*t, i.clone())))
 }
 
 #[cfg(test)]
