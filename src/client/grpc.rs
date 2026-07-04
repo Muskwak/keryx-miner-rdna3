@@ -30,11 +30,6 @@ use tonic::{transport::Channel as TonicChannel, Streaming};
 static EXTRA_DATA: &str = concat!(env!("CARGO_PKG_VERSION"), "/", env!("PACKAGE_COMPILE_TIME"));
 type BlockHandle = JoinHandle<Result<(), PollSendError<KaspadMessage>>>;
 
-/// Max AiRequest queue size — drop oldest when full to prevent unbounded memory growth.
-const MAX_AI_QUEUE_SIZE: usize = 64;
-/// Max unique stable-ids tracked for deduplication — evict when full.
-const MAX_AI_SEEN_IDS: usize = 10_000;
-
 #[allow(dead_code)]
 pub struct KeryxdHandler {
     client: RpcClient<TonicChannel>,
